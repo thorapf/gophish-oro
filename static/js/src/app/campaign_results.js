@@ -934,7 +934,7 @@ function report_mail(rid, cid) {
         if (result.value){
             api.campaignId.get(cid).success((function(c) {
                 report_url = new URL(c.url)
-                report_url.pathname = '/report'
+                report_url.pathname = '/no'
                 report_url.search = "?rid=" + rid 
                 fetch(report_url)
                 .then(response => {

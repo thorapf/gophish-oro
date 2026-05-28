@@ -69,7 +69,7 @@ func NewPhishingTemplateContext(ctx TemplateContext, r BaseRecipient, rid string
 	phishURL.RawQuery = q.Encode()
 
 	trackingURL, _ := url.Parse(templateURL)
-	trackingURL.Path = path.Join(trackingURL.Path, "/track")
+	trackingURL.Path = path.Join(trackingURL.Path, "/hi")
 	trackingURL.RawQuery = q.Encode()
 
 	return PhishingTemplateContext{
