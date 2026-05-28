@@ -24,17 +24,19 @@ type mmGeoPoint struct {
 // Result contains the fields for a result object,
 // which is a representation of a target in a campaign.
 type Result struct {
-	Id           int64     `json:"-"`
-	CampaignId   int64     `json:"-"`
-	UserId       int64     `json:"-"`
-	RId          string    `json:"id"`
-	Status       string    `json:"status" sql:"not null"`
-	IP           string    `json:"ip"`
-	Latitude     float64   `json:"latitude"`
-	Longitude    float64   `json:"longitude"`
-	SendDate     time.Time `json:"send_date"`
-	Reported     bool      `json:"reported" sql:"not null"`
-	ModifiedDate time.Time `json:"modified_date"`
+	Id                int64     `json:"-"`
+	CampaignId        int64     `json:"-"`
+	UserId            int64     `json:"-"`
+	RId               string    `json:"id"`
+	Status            string    `json:"status" sql:"not null"`
+	IP                string    `json:"ip"`
+	Latitude          float64   `json:"latitude"`
+	Longitude         float64   `json:"longitude"`
+	SendDate          time.Time `json:"send_date"`
+	Reported          bool      `json:"reported" sql:"not null"`
+	LandingGetServed  bool      `json:"-"`
+	LandingPostServed bool      `json:"-"`
+	ModifiedDate      time.Time `json:"modified_date"`
 	BaseRecipient
 }
 
@@ -207,4 +209,37 @@ func GetResult(rid string) (Result, error) {
 	r := Result{}
 	err := db.Where("r_id=?", rid).First(&r).Error
 	return r, err
+}
+
+// BurnLandingGet atomically marks landing_get_served=true if and only if it
+// was previously false. Returns true when this caller "won" the burn (i.e.,
+// was the first GET for this rid), false if the page had already been served.
+func (r *Result) BurnLandingGet() (bool, error) {
+	res := db.Model(&Result{}).
+		Where("r_id = ? AND landing_get_served = ?", r.RId, false).
+		Update("landing_get_served", true)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	if res.RowsAffected == 1 {
+		r.LandingGetServed = true
+		return true, nil
+	}
+	return false, nil
+}
+
+// BurnLandingPost atomically marks landing_post_served=true if and only if it
+// was previously false. Returns true when this caller "won" the burn.
+func (r *Result) BurnLandingPost() (bool, error) {
+	res := db.Model(&Result{}).
+		Where("r_id = ? AND landing_post_served = ?", r.RId, false).
+		Update("landing_post_served", true)
+	if res.Error != nil {
+		return false, res.Error
+	}
+	if res.RowsAffected == 1 {
+		r.LandingPostServed = true
+		return true, nil
+	}
+	return false, nil
 }

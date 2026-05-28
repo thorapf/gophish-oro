@@ -7,13 +7,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/gophish/gophish/config"
 	ctx "github.com/gophish/gophish/context"
-	"github.com/gophish/gophish/controllers/api"
 	log "github.com/gophish/gophish/logger"
 	"github.com/gophish/gophish/models"
 	"github.com/gophish/gophish/util"
@@ -30,17 +28,17 @@ var ErrInvalidRequest = errors.New("Invalid request")
 // has already been marked as complete.
 var ErrCampaignComplete = errors.New("Event received on completed campaign")
 
-// TransparencyResponse is the JSON response provided when a third-party
-// makes a request to the transparency handler.
-type TransparencyResponse struct {
-	Server         string    `json:"server"`
-	ContactAddress string    `json:"contact_address"`
-	SendDate       time.Time `json:"send_date"`
-}
+// notFoundRedirectURL is where the phishing server sends any request that
+// would otherwise have been a 404 (invalid rid, missing rid, burnt rid,
+// preview / transparency probe, unmatched route, etc.).
+const notFoundRedirectURL = "https://www.thoropass.com/platform/penetration-testing"
 
-// TransparencySuffix (when appended to a valid result ID), will cause Gophish
-// to return a transparency response.
-const TransparencySuffix = "+"
+// phishNotFound replaces http.NotFound on the phishing server. Every dead-end
+// request is 302-redirected to notFoundRedirectURL so a casual visitor or
+// scanner sees a benign marketing page instead of a 404 fingerprint.
+func phishNotFound(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, notFoundRedirectURL, http.StatusFound)
+}
 
 // PhishingServerOption is a functional option that is used to configure the
 // the phishing server
@@ -49,9 +47,8 @@ type PhishingServerOption func(*PhishingServer)
 // PhishingServer is an HTTP server that implements the campaign event
 // handlers, such as email open tracking, click tracking, and more.
 type PhishingServer struct {
-	server         *http.Server
-	config         config.PhishServer
-	contactAddress string
+	server *http.Server
+	config config.PhishServer
 }
 
 // NewPhishingServer returns a new instance of the phishing server with
@@ -71,14 +68,6 @@ func NewPhishingServer(config config.PhishServer, options ...PhishingServerOptio
 	}
 	ps.registerRoutes()
 	return ps
-}
-
-// WithContactAddress sets the contact address used by the transparency
-// handlers
-func WithContactAddress(addr string) PhishingServerOption {
-	return func(ps *PhishingServer) {
-		ps.contactAddress = addr
-	}
 }
 
 // Start launches the phishing server, listening on the configured address.
@@ -116,6 +105,7 @@ func (ps *PhishingServer) registerRoutes() {
 	router.HandleFunc("/{path:.*}/report", ps.ReportHandler)
 	router.HandleFunc("/report", ps.ReportHandler)
 	router.HandleFunc("/{path:.*}", ps.PhishHandler)
+	router.NotFoundHandler = http.HandlerFunc(phishNotFound)
 
 	// Setup GZIP compression
 	gzipWrapper, _ := gziphandler.NewGzipLevelHandler(gzip.BestCompression)
@@ -138,23 +128,11 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
 			log.Error(err)
 		}
-		http.NotFound(w, r)
-		return
-	}
-	// Check for a preview
-	if _, ok := ctx.Get(r, "result").(models.EmailRequest); ok {
-		http.ServeFile(w, r, "static/images/pixel.png")
+		phishNotFound(w, r)
 		return
 	}
 	rs := ctx.Get(r, "result").(models.Result)
-	rid := ctx.Get(r, "rid").(string)
 	d := ctx.Get(r, "details").(models.EventDetails)
-
-	// Check for a transparency request
-	if strings.HasSuffix(rid, TransparencySuffix) {
-		ps.TransparencyHandler(w, r)
-		return
-	}
 
 	err = rs.HandleEmailOpened(d)
 	if err != nil {
@@ -172,23 +150,11 @@ func (ps *PhishingServer) ReportHandler(w http.ResponseWriter, r *http.Request) 
 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
 			log.Error(err)
 		}
-		http.NotFound(w, r)
-		return
-	}
-	// Check for a preview
-	if _, ok := ctx.Get(r, "result").(models.EmailRequest); ok {
-		w.WriteHeader(http.StatusNoContent)
+		phishNotFound(w, r)
 		return
 	}
 	rs := ctx.Get(r, "result").(models.Result)
-	rid := ctx.Get(r, "rid").(string)
 	d := ctx.Get(r, "details").(models.EventDetails)
-
-	// Check for a transparency request
-	if strings.HasSuffix(rid, TransparencySuffix) {
-		ps.TransparencyHandler(w, r)
-		return
-	}
 
 	err = rs.HandleEmailReport(d)
 	if err != nil {
@@ -206,43 +172,36 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
 			log.Error(err)
 		}
-		http.NotFound(w, r)
+		phishNotFound(w, r)
 		return
 	}
 	w.Header().Set("X-Server", config.ServerName) // Useful for checking if this is a GoPhish server (e.g. for campaign reporting plugins)
-	var ptx models.PhishingTemplateContext
-	// Check for a preview
-	if preview, ok := ctx.Get(r, "result").(models.EmailRequest); ok {
-		ptx, err = models.NewPhishingTemplateContext(&preview, preview.BaseRecipient, preview.RId)
-		if err != nil {
-			log.Error(err)
-			http.NotFound(w, r)
-			return
-		}
-		p, err := models.GetPage(preview.PageId, preview.UserId)
-		if err != nil {
-			log.Error(err)
-			http.NotFound(w, r)
-			return
-		}
-		renderPhishResponse(w, r, ptx, p)
-		return
-	}
 	rs := ctx.Get(r, "result").(models.Result)
-	rid := ctx.Get(r, "rid").(string)
 	c := ctx.Get(r, "campaign").(models.Campaign)
 	d := ctx.Get(r, "details").(models.EventDetails)
 
-	// Check for a transparency request
-	if strings.HasSuffix(rid, TransparencySuffix) {
-		ps.TransparencyHandler(w, r)
+	// One-shot guard: at most one GET and one POST per rid. The burn is an
+	// atomic conditional UPDATE, so concurrent requests for the same rid can
+	// only have one winner per method.
+	burned := true
+	switch r.Method {
+	case "GET":
+		burned, err = rs.BurnLandingGet()
+	case "POST":
+		burned, err = rs.BurnLandingPost()
+	}
+	if err != nil {
+		log.Error(err)
+	}
+	if !burned {
+		phishNotFound(w, r)
 		return
 	}
 
 	p, err := models.GetPage(c.PageId, c.UserId)
 	if err != nil {
 		log.Error(err)
-		http.NotFound(w, r)
+		phishNotFound(w, r)
 		return
 	}
 	switch {
@@ -257,10 +216,11 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 			log.Error(err)
 		}
 	}
-	ptx, err = models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
+	ptx, err := models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
 	if err != nil {
 		log.Error(err)
-		http.NotFound(w, r)
+		phishNotFound(w, r)
+		return
 	}
 	renderPhishResponse(w, r, ptx, p)
 }
@@ -276,7 +236,7 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
 			redirectURL, err := models.ExecuteTemplate(p.RedirectURL, ptx)
 			if err != nil {
 				log.Error(err)
-				http.NotFound(w, r)
+				phishNotFound(w, r)
 				return
 			}
 			http.Redirect(w, r, redirectURL, http.StatusFound)
@@ -287,7 +247,7 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
 	html, err := models.ExecuteTemplate(p.HTML, ptx)
 	if err != nil {
 		log.Error(err)
-		http.NotFound(w, r)
+		phishNotFound(w, r)
 		return
 	}
 	w.Write([]byte(html))
@@ -296,18 +256,6 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
 // RobotsHandler prevents search engines, etc. from indexing phishing materials
 func (ps *PhishingServer) RobotsHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "User-agent: *\nDisallow: /")
-}
-
-// TransparencyHandler returns a TransparencyResponse for the provided result
-// and campaign.
-func (ps *PhishingServer) TransparencyHandler(w http.ResponseWriter, r *http.Request) {
-	rs := ctx.Get(r, "result").(models.Result)
-	tr := &TransparencyResponse{
-		Server:         config.ServerName,
-		SendDate:       rs.SendDate,
-		ContactAddress: ps.contactAddress,
-	}
-	api.JSONResponse(w, tr, http.StatusOK)
 }
 
 // setupContext handles some of the administrative work around receiving a new
@@ -322,30 +270,7 @@ func setupContext(r *http.Request) (*http.Request, error) {
 	if rid == "" {
 		return r, ErrInvalidRequest
 	}
-	// Since we want to support the common case of adding a "+" to indicate a
-	// transparency request, we need to take care to handle the case where the
-	// request ends with a space, since a "+" is technically reserved for use
-	// as a URL encoding of a space.
-	if strings.HasSuffix(rid, " ") {
-		// We'll trim off the space
-		rid = strings.TrimRight(rid, " ")
-		// Then we'll add the transparency suffix
-		rid = fmt.Sprintf("%s%s", rid, TransparencySuffix)
-	}
-	// Finally, if this is a transparency request, we'll need to verify that
-	// a valid rid has been provided, so we'll look up the result with a
-	// trimmed parameter.
-	id := strings.TrimSuffix(rid, TransparencySuffix)
-	// Check to see if this is a preview or a real result
-	if strings.HasPrefix(id, models.PreviewPrefix) {
-		rs, err := models.GetEmailRequestByResultId(id)
-		if err != nil {
-			return r, err
-		}
-		r = ctx.Set(r, "result", rs)
-		return r, nil
-	}
-	rs, err := models.GetResult(id)
+	rs, err := models.GetResult(rid)
 	if err != nil {
 		return r, err
 	}
@@ -374,7 +299,6 @@ func setupContext(r *http.Request) (*http.Request, error) {
 	d.Browser["address"] = ip
 	d.Browser["user-agent"] = r.Header.Get("User-Agent")
 
-	r = ctx.Set(r, "rid", rid)
 	r = ctx.Set(r, "result", rs)
 	r = ctx.Set(r, "campaign", c)
 	r = ctx.Set(r, "details", d)
