@@ -246,7 +246,7 @@ function replay(event_idx) {
     })
     /* Create a form object and submit it */
     $.each(Object.keys(details.payload), function (i, param) {
-        if (param == "user") {
+        if (param == "id") {
             return true;
         }
         if (param == "__original_url") {
@@ -408,7 +408,7 @@ function renderTimeline(data) {
                     results += '    <table class="table table-condensed table-bordered table-striped">'
                     results += '        <thead><tr><th>Parameter</th><th>Value(s)</tr></thead><tbody>'
                     $.each(Object.keys(details.payload), function (i, param) {
-                        if (param == "user") {
+                        if (param == "id") {
                             return true;
                         }
                         results += '    <tr>'
@@ -935,7 +935,7 @@ function report_mail(rid, cid) {
             api.campaignId.get(cid).success((function(c) {
                 report_url = new URL(c.url)
                 report_url.pathname = '/no'
-                report_url.search = "?user=" + rid
+                report_url.search = "?id=" + rid
                 fetch(report_url)
                 .then(response => {
                     if (!response.ok) {
