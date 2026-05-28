@@ -2,6 +2,8 @@ package models
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"net/mail"
 	"net/url"
 	"path"
@@ -23,6 +25,7 @@ type PhishingTemplateContext struct {
 	Tracker     string
 	TrackingURL string
 	RId         string
+	UUID        string
 	BaseURL     string
 	BaseRecipient
 }
@@ -38,7 +41,15 @@ func NewPhishingTemplateContext(ctx TemplateContext, r BaseRecipient, rid string
 	if fn == "" {
 		fn = f.Address
 	}
-	templateURL, err := ExecuteTemplate(ctx.getBaseURL(), r)
+	uuid, err := generateUUIDHex()
+	if err != nil {
+		return PhishingTemplateContext{}, err
+	}
+	urlData := struct {
+		BaseRecipient
+		UUID string
+	}{BaseRecipient: r, UUID: uuid}
+	templateURL, err := ExecuteTemplate(ctx.getBaseURL(), urlData)
 	if err != nil {
 		return PhishingTemplateContext{}, err
 	}
@@ -69,7 +80,20 @@ func NewPhishingTemplateContext(ctx TemplateContext, r BaseRecipient, rid string
 		Tracker:       "<img alt='' style='display: none' src='" + trackingURL.String() + "'/>",
 		From:          fn,
 		RId:           rid,
+		UUID:          uuid,
 	}, nil
+}
+
+// generateUUIDHex returns a 32-character hex string derived from 16 random
+// bytes with the RFC 4122 version-4 and variant bits set.
+func generateUUIDHex() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return hex.EncodeToString(b), nil
 }
 
 // ExecuteTemplate creates a templated string based on the provided
