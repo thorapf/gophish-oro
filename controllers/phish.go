@@ -3,12 +3,13 @@ package controllers
 import (
 	"compress/gzip"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -87,7 +88,7 @@ func (ps *PhishingServer) Shutdown() error {
 // phishNotFound is the dead-end response handler. If a not_found_redirect_url
 // is configured under phish_server, every dead-end request (invalid rid,
 // missing rid, burnt rid, completed campaign, unmatched route, failed
-// referer check, etc.) is 302-redirected there so a casual visitor or
+// token validation, etc.) is 302-redirected there so a casual visitor or
 // scanner sees a benign page instead of a 404 fingerprint. If the config
 // field is empty, the original 404 behavior is preserved.
 func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) {
@@ -98,29 +99,24 @@ func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) 
 	http.NotFound(w, r)
 }
 
-// refererAllowed parses the request's Referer header and returns true iff the
-// hostname matches one of the redirector.allowed_referer entries (case
-// insensitive). Empty list or unparseable / missing Referer → false, which
-// means strict-deny by default.
-func (ps *PhishingServer) refererAllowed(r *http.Request) bool {
-	ref := r.Header.Get("Referer")
-	if ref == "" {
+// tokenValid recomputes the HMAC-SHA256 token for the rid in the request
+// and compares it (constant-time) against the ?token= query parameter.
+// Returns false on any missing/malformed input or mismatch, including when
+// the configured secret is empty (strict-deny by default).
+func (ps *PhishingServer) tokenValid(r *http.Request) bool {
+	rid := r.URL.Query().Get(models.RecipientParameter)
+	provided := r.URL.Query().Get("token")
+	if rid == "" || provided == "" {
 		return false
 	}
-	u, err := url.Parse(ref)
-	if err != nil {
+	secret, err := hex.DecodeString(ps.config.Redirector.Secret)
+	if err != nil || len(secret) == 0 {
 		return false
 	}
-	host := u.Hostname()
-	if host == "" {
-		return false
-	}
-	for _, allowed := range ps.config.Redirector.AllowedReferer {
-		if strings.EqualFold(host, allowed) {
-			return true
-		}
-	}
-	return false
+	h := hmac.New(sha256.New, secret)
+	h.Write([]byte(rid))
+	expected := hex.EncodeToString(h.Sum(nil))
+	return hmac.Equal([]byte(expected), []byte(provided))
 }
 
 // CreatePhishingRouter creates the router that handles phishing connections.
@@ -129,8 +125,10 @@ func (ps *PhishingServer) registerRoutes() {
 	fileServer := http.FileServer(unindexed.Dir("./static/endpoint/"))
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", fileServer))
 	router.HandleFunc("/hi", ps.TrackHandler)
-	router.HandleFunc("/robots.txt", ps.RobotsHandler)
 	router.HandleFunc("/{path:.*}/hi", ps.TrackHandler)
+	router.HandleFunc("/beep", ps.BeepHandler)
+	router.HandleFunc("/{path:.*}/beep", ps.BeepHandler)
+	router.HandleFunc("/robots.txt", ps.RobotsHandler)
 	router.HandleFunc("/{path:.*}", ps.PhishHandler)
 	router.NotFoundHandler = http.HandlerFunc(ps.phishNotFound)
 
@@ -149,6 +147,10 @@ func (ps *PhishingServer) registerRoutes() {
 
 // TrackHandler tracks emails as they are opened, updating the status for the given Result
 func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
+	if !ps.tokenValid(r) {
+		ps.phishNotFound(w, r)
+		return
+	}
 	r, err := setupContext(r)
 	if err != nil {
 		// Log the error if it wasn't something we can safely ignore
@@ -168,9 +170,40 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "static/images/pixel.png")
 }
 
+// BeepHandler is the upstream redirector's bot-detection signal endpoint.
+// Cloudflare Worker (or any redirector) makes a server-side GET to
+// /beep?id=<rid>&token=<hmac> when it has decided the visitor is a bot.
+// On valid token, gophish appends a "Bot Click" event to the result's
+// timeline; it never burns the rid, never renders anything, and returns
+// 200 with no body.
+func (ps *PhishingServer) BeepHandler(w http.ResponseWriter, r *http.Request) {
+	if !ps.tokenValid(r) {
+		ps.phishNotFound(w, r)
+		return
+	}
+	r, err := setupContext(r)
+	if err != nil {
+		if err != ErrInvalidRequest && err != ErrCampaignComplete {
+			log.Error(err)
+		}
+		ps.phishNotFound(w, r)
+		return
+	}
+	rs := ctx.Get(r, "result").(models.Result)
+	d := ctx.Get(r, "details").(models.EventDetails)
+	if err := rs.HandleBotClick(d); err != nil {
+		log.Error(err)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
 // PhishHandler handles incoming client connections and registers the associated actions performed
 // (such as clicked link, etc.)
 func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
+	if !ps.tokenValid(r) {
+		ps.phishNotFound(w, r)
+		return
+	}
 	r, err := setupContext(r)
 	if err != nil {
 		// Log the error if it wasn't something we can safely ignore
@@ -183,31 +216,6 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 	rs := ctx.Get(r, "result").(models.Result)
 	c := ctx.Get(r, "campaign").(models.Campaign)
 	d := ctx.Get(r, "details").(models.EventDetails)
-
-	// HEAD method is the redirector's bot-ping path. It bypasses the referer
-	// check (no browser navigation involved) and never burns the rid. A
-	// "Bot Click" event is only recorded when the request's User-Agent
-	// matches the configured redirector.bot_ua; HEAD with any other UA is a
-	// silent 200 so probes don't create noise in the timeline.
-	if r.Method == http.MethodHead {
-		botUA := ps.config.Redirector.BotUA
-		if botUA != "" && r.Header.Get("User-Agent") == botUA {
-			if err := rs.HandleBotClick(d); err != nil {
-				log.Error(err)
-			}
-		}
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Referer gate for GET / POST. Every request that would render or
-	// process the landing page must come through a known redirector
-	// hostname; the rid one-shot guard provides replay protection, the
-	// referer check provides the "no direct access" property.
-	if !ps.refererAllowed(r) {
-		ps.phishNotFound(w, r)
-		return
-	}
 
 	// One-shot guard: at most one GET and one POST per rid. The burn is an
 	// atomic conditional UPDATE, so concurrent requests for the same rid can

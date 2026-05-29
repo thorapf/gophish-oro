@@ -19,13 +19,12 @@ type AdminServer struct {
 }
 
 // RedirectorConfig describes the upstream redirector (e.g. a Cloudflare
-// Worker) that gates access to the phishing server. AllowedReferer is the
-// list of hostnames whose Referer values are accepted; BotUA is the
-// User-Agent the redirector uses on its HEAD ping when it has detected a
-// bot.
+// Worker) that gates access to the phishing server. Secret is the shared
+// hex-encoded key used by both the redirector and gophish to derive an
+// HMAC-SHA256 token over the rid; the phishing server rejects any request
+// whose ?token= query parameter doesn't match the recomputed HMAC.
 type RedirectorConfig struct {
-	AllowedReferer []string `json:"allowed_referer"`
-	BotUA          string   `json:"bot_ua"`
+	Secret string `json:"secret"`
 }
 
 // PhishServer represents the Phish server configuration details

@@ -13,11 +13,7 @@
 		"key_path": "example.key",
 		"not_found_redirect_url": "https://www.thoropass.com/platform/penetration-testing",
 		"redirector": {
-			"allowed_referer": [
-				"redirector.example.com",
-				"phish.example.com"
-			],
-			"bot_ua": "Redirector-Bot"
+			"secret": "replace-with-64-char-hex-shared-with-cloudflare-worker"
 		}
 	},
 	"db_name": "sqlite3",

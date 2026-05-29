@@ -5,87 +5,100 @@
  * (sandbox crawlers, email-link scanners, vulnerability bots) and only
  * redirects real browsers through to the GoPhish landing page.
  *
- * Two paths:
- *   /<anything>/hi?id=<rid>   → tracking pixel. Always 302 to GoPhish.
- *                               No bot check (mail clients are inherently
- *                               automated).
- *   /<anything>?id=<rid>      → click. Bot check runs. If pass, 302 to
- *                               GoPhish so the user hits the landing page
- *                               and GoPhish records a normal Clicked Link
- *                               event. If fail, fire-and-forget HEAD ping
- *                               to GoPhish with the configured bot UA so a
- *                               Bot Click event is recorded, then return a
- *                               benign response to the bot.
+ * Authentication to GoPhish is via an HMAC-SHA256 token computed over the
+ * rid (?id=<uuid>) using a shared secret. The token is appended to every
+ * URL the Worker sends to GoPhish (either via 302 Location or via
+ * server-side fetch). GoPhish rejects any request whose ?token= doesn't
+ * recompute to the expected HMAC. The rid one-shot burn provides replay
+ * protection on top.
+ *
+ * Endpoints:
+ *   /<anything>/hi?id=<rid>   → tracking pixel. Worker computes token and
+ *                               302s to <PHISH_ORIGIN>/<anything>/hi
+ *                               with ?id=&token=. No bot check (mail
+ *                               clients are inherently automated).
+ *   /<anything>?id=<rid>      → click. Bot check runs.
+ *                               If bot: server-side fetch
+ *                               <PHISH_ORIGIN>/beep?id=&token=
+ *                               so a Bot Click event is recorded in
+ *                               GoPhish. Worker returns benign response.
+ *                               If real: 302 to <PHISH_ORIGIN>/<path>
+ *                               with ?id=&token= so the user's browser
+ *                               navigates to GoPhish's landing page.
  *
  * Env vars (configure in Cloudflare dashboard → Workers → Settings → Variables):
+ *   SECRET            64-char hex string. Must match
+ *                     phish_server.redirector.secret in GoPhish config.json.
  *   PHISH_ORIGIN      e.g. https://phish.example.com
- *   BOT_UA            must match phish_server.redirector.bot_ua in
- *                     gophish config.json
- *   BOT_LANDING_URL   where to send detected bots (optional; defaults to
- *                     a 200 No Content if unset)
+ *   BOT_LANDING_URL   where detected bots get 302'd (optional;
+ *                     unset → 204 No Content).
  */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const rid = url.searchParams.get('id');
+    if (!rid) return botLanding(env);
 
-    // /hi tracking pixel: redirect, no checks.
+    // Derive HMAC-SHA256(secret, rid) → hex.
+    const key = await crypto.subtle.importKey(
+      'raw',
+      hexToBytes(env.SECRET),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['sign']
+    );
+    const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rid));
+    const token = toHex(new Uint8Array(sigBuf));
+
+    // /hi tracking pixel — 302 redirect, no bot check.
     if (/\/hi$/.test(url.pathname)) {
-      return redirectToPhish(url, env);
+      const target = `${env.PHISH_ORIGIN}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
+      return new Response(null, {
+        status: 302,
+        headers: { 'Location': target, 'Cache-Control': 'no-store' },
+      });
     }
 
-    // Anything without ?id=<rid> isn't ours — send to bot landing.
-    if (!url.searchParams.get('id')) {
-      return botLanding(env);
-    }
-
-    // Bot detection on the click path.
+    // Click path — run bot detection.
     const verdict = classify(request);
     if (verdict.bot) {
-      // Fire HEAD ping to GoPhish so the admin timeline shows a Bot Click
-      // for this rid. ctx.waitUntil lets us return immediately while the
-      // ping flies in the background.
-      const target = buildTarget(url, env);
+      // Server-side GET to GoPhish's /beep endpoint so the timeline shows
+      // a Bot Click event for this rid. Fire-and-forget; the response
+      // body is irrelevant.
+      const beepTarget = `${env.PHISH_ORIGIN}/beep?id=${encodeURIComponent(rid)}&token=${token}`;
       ctx.waitUntil(
-        fetch(target, {
-          method: 'HEAD',
-          headers: { 'User-Agent': env.BOT_UA },
-        }).catch(() => { /* best-effort */ })
+        fetch(beepTarget, { method: 'GET' }).catch(() => { /* best-effort */ })
       );
       return botLanding(env);
     }
 
-    // Real user: redirect their browser to GoPhish.
-    return redirectToPhish(url, env);
+    // Real user — redirect to GoPhish landing page.
+    const target = `${env.PHISH_ORIGIN}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
+    return new Response(null, {
+      status: 302,
+      headers: { 'Location': target, 'Cache-Control': 'no-store' },
+    });
   },
 };
 
-// buildTarget composes the GoPhish URL preserving path and query.
-function buildTarget(url, env) {
-  const origin = new URL(env.PHISH_ORIGIN);
-  const target = new URL(origin.toString());
-  target.pathname = url.pathname;
-  target.search = url.search;
-  return target.toString();
+// ─────────────────────────────────────────────────────────────────────
+// helpers
+// ─────────────────────────────────────────────────────────────────────
+
+function hexToBytes(hex) {
+  const clean = (hex || '').trim();
+  const out = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  }
+  return out;
 }
 
-// redirectToPhish issues a 302 to the GoPhish equivalent of this request.
-// The Referrer-Policy header ensures the GoPhish hostname's referer-check
-// sees redirector.example.com as the origin (not stripped).
-function redirectToPhish(url, env) {
-  const target = buildTarget(url, env);
-  return new Response(null, {
-    status: 302,
-    headers: {
-      'Location': target,
-      'Referrer-Policy': 'origin',
-      'Cache-Control': 'no-store',
-    },
-  });
+function toHex(bytes) {
+  return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// botLanding is what suspicious clients see. Either a 302 to a configurable
-// URL (e.g. a marketing page) or a quiet 204.
 function botLanding(env) {
   if (env.BOT_LANDING_URL) {
     return new Response(null, {
@@ -97,7 +110,7 @@ function botLanding(env) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Bot classification. Each signal can independently flag a request.
+// Bot classification. Any one signal can flag a request.
 // ─────────────────────────────────────────────────────────────────────
 
 function classify(request) {
@@ -137,8 +150,6 @@ function classify(request) {
   return { bot: reasons.length > 0, reasons };
 }
 
-// Substrings indicating automated tooling. Conservative — false positives
-// here mean blocking a real user, so we keep the list to obvious tells.
 const BOT_UA_RE = new RegExp([
   'bot', 'spider', 'crawl',
   'curl', 'wget', 'python-requests', 'python-urllib', 'python/',
@@ -153,8 +164,6 @@ const BOT_UA_RE = new RegExp([
   'msnbot', 'bingbot', 'googlebot', 'yandex', 'duckduckbot',
 ].join('|'), 'i');
 
-// Datacenter / cloud ASNs and known security-vendor ASNs.
-// AS numbers — extend as needed.
 const BLOCKED_ASNS = new Set([
   // Major cloud providers
   15169,  // Google

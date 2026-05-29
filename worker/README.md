@@ -2,7 +2,8 @@
 
 A single-file Cloudflare Worker that gates access to a GoPhish phishing
 server. Filters bots and email-link sandboxes; passes real users through
-to GoPhish.
+to GoPhish. Authentication to GoPhish is via an HMAC-SHA256 token over
+the rid, using a shared secret known to both this Worker and GoPhish.
 
 ## Deployment (no wrangler, no CLI)
 
@@ -18,8 +19,8 @@ to GoPhish.
 
 | Name              | Example                                  | Purpose |
 |-------------------|------------------------------------------|---------|
+| `SECRET`          | 64 hex chars (32 bytes)                  | HMAC key. Must match `phish_server.redirector.secret` in GoPhish `config.json`. Generate with `openssl rand -hex 32`. |
 | `PHISH_ORIGIN`    | `https://phish.example.com`              | Where the actual GoPhish phishing server lives. Origin only (no path). |
-| `BOT_UA`          | `Redirector-Bot`                         | User-Agent used on the HEAD ping for bot-detected visits. Must match `phish_server.redirector.bot_ua` in GoPhish `config.json`. |
 
 ## Optional environment variables
 
@@ -33,26 +34,20 @@ In your GoPhish `config.json`, under `phish_server`:
 
 ```json
 "redirector": {
-    "allowed_referer": [
-        "redirector.example.com",
-        "phish.example.com"
-    ],
-    "bot_ua": "Redirector-Bot"
+    "secret": "<the same 64-char hex you set in the Worker SECRET env var>"
 }
 ```
 
-- `allowed_referer` must include both the redirector hostname (where users
-  arrive from) and the GoPhish hostname (where form POSTs originate).
-- `bot_ua` must exactly match the Worker's `BOT_UA` env var.
+Restart GoPhish after editing `config.json`.
 
 ## How it routes
 
 | Request to redirector            | Action |
 |----------------------------------|--------|
-| `GET /<path>/hi?id=<rid>`        | 302 → `<PHISH_ORIGIN>/<path>/hi?id=<rid>`. No bot check (it's a tracking pixel; mail clients are automated). |
-| `GET /<path>?id=<rid>` (bot)     | Fire-and-forget HEAD to GoPhish with `User-Agent: <BOT_UA>` so GoPhish records a *Bot Click* event. Then send the bot to `BOT_LANDING_URL` (or 204). |
-| `GET /<path>?id=<rid>` (real)    | 302 → `<PHISH_ORIGIN>/<path>?id=<rid>` with `Referrer-Policy: origin` so the GoPhish referer check passes. |
-| Anything without `?id=<rid>`     | Send to `BOT_LANDING_URL` (or 204). |
+| `GET /<path>/hi?id=<rid>`        | 302 → `<PHISH_ORIGIN>/<path>/hi?id=<rid>&token=<hmac>`. No bot check. Mail clients / image proxies follow the redirect; GoPhish logs *Email Opened*. |
+| `GET /<path>?id=<rid>` (bot)     | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&token=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
+| `GET /<path>?id=<rid>` (real)    | 302 → `<PHISH_ORIGIN>/<path>?id=<rid>&token=<hmac>`. User's browser navigates to GoPhish, which logs *Clicked Link* and renders the landing page. |
+| Anything without `?id=<rid>`     | 302 to `BOT_LANDING_URL` (or 204). |
 
 ## Bot detection signals (no captcha, no JS challenge)
 
@@ -71,7 +66,32 @@ Any one of these flags the request as a bot:
 5. **Accept-Language missing** — headless tooling defaults often omit it.
 
 Edit the `BOT_UA_RE` regex and `BLOCKED_ASNS` set inside `worker.js` to tune
-for your engagement. Both are at the bottom of the file.
+for your engagement.
+
+## Landing page authoring (one rule)
+
+Form POSTs inherit the token from the document URL only if the form's
+`action` attribute is empty or absent:
+
+```html
+<!-- correct: POST goes back to the same URL, which already has &token= -->
+<form method="POST">
+   ...
+</form>
+
+<!-- also correct -->
+<form method="POST" action="">
+   ...
+</form>
+
+<!-- wrong: action="{{.URL}}" expands to the redirector hostname without
+     a token, so GoPhish will reject the POST -->
+<form method="POST" action="{{.URL}}">
+```
+
+If you have existing campaign Page HTML that uses `action="{{.URL}}"`, edit
+it to drop the action attribute. Otherwise form submissions land at
+GoPhish without a token and dead-end to `not_found_redirect_url`.
 
 ## Verifying the setup
 
@@ -79,20 +99,22 @@ for your engagement. Both are at the bottom of the file.
    landing page; the campaign timeline shows *Clicked Link* with your IP.
 2. From a terminal:
    ```
-   curl -v https://redirector.example.com/abc?id=<your-rid>
+   curl -v "https://redirector.example.com/abc?id=<your-rid>"
    ```
    Should return `204` (or 302 to `BOT_LANDING_URL`). The campaign
-   timeline should show a *Bot Click* event.
+   timeline should show a *Bot Click* event for that rid.
 3. Try direct access to GoPhish bypassing the redirector:
    ```
-   curl -v https://phish.example.com/?id=<your-rid>
+   curl -v "https://phish.example.com/?id=<your-rid>"
    ```
-   Should return 302 to `not_found_redirect_url` (no referer). The rid is
-   not burnt.
+   Should return 302 to `not_found_redirect_url` (no token).
 
 ## Rotation
 
-The `BOT_UA` value functions as a weak shared secret on the HEAD-ping
-path. If you suspect leakage, rotate it: update both the Worker env var
-and GoPhish `config.json`, restart GoPhish. Worker takes effect
-immediately (Cloudflare propagates within seconds).
+If you suspect the `SECRET` has leaked:
+1. Generate a new value: `openssl rand -hex 32`.
+2. Update the Worker env var. Save & deploy.
+3. Update `phish_server.redirector.secret` in GoPhish `config.json`.
+4. Restart GoPhish.
+
+Any in-flight links signed under the old secret stop working immediately.
