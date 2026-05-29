@@ -28,18 +28,6 @@ var ErrInvalidRequest = errors.New("Invalid request")
 // has already been marked as complete.
 var ErrCampaignComplete = errors.New("Event received on completed campaign")
 
-// notFoundRedirectURL is where the phishing server sends any request that
-// would otherwise have been a 404 (invalid rid, missing rid, burnt rid,
-// preview / transparency probe, unmatched route, etc.).
-const notFoundRedirectURL = "https://www.thoropass.com/platform/penetration-testing"
-
-// phishNotFound replaces http.NotFound on the phishing server. Every dead-end
-// request is 302-redirected to notFoundRedirectURL so a casual visitor or
-// scanner sees a benign marketing page instead of a 404 fingerprint.
-func phishNotFound(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, notFoundRedirectURL, http.StatusFound)
-}
-
 // PhishingServerOption is a functional option that is used to configure the
 // the phishing server
 type PhishingServerOption func(*PhishingServer)
@@ -94,6 +82,20 @@ func (ps *PhishingServer) Shutdown() error {
 	return ps.server.Shutdown(ctx)
 }
 
+// phishNotFound is the dead-end response handler. If a not_found_redirect_url
+// is configured under phish_server, every dead-end request (invalid rid,
+// missing rid, burnt rid, completed campaign, unmatched route, etc.) is
+// 302-redirected there so a casual visitor or scanner sees a benign page
+// instead of a 404 fingerprint. If the config field is empty, the original
+// 404 behavior is preserved.
+func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) {
+	if ps.config.NotFoundRedirectURL != "" {
+		http.Redirect(w, r, ps.config.NotFoundRedirectURL, http.StatusFound)
+		return
+	}
+	http.NotFound(w, r)
+}
+
 // CreatePhishingRouter creates the router that handles phishing connections.
 func (ps *PhishingServer) registerRoutes() {
 	router := mux.NewRouter()
@@ -102,10 +104,8 @@ func (ps *PhishingServer) registerRoutes() {
 	router.HandleFunc("/hi", ps.TrackHandler)
 	router.HandleFunc("/robots.txt", ps.RobotsHandler)
 	router.HandleFunc("/{path:.*}/hi", ps.TrackHandler)
-	router.HandleFunc("/{path:.*}/no", ps.ReportHandler)
-	router.HandleFunc("/no", ps.ReportHandler)
 	router.HandleFunc("/{path:.*}", ps.PhishHandler)
-	router.NotFoundHandler = http.HandlerFunc(phishNotFound)
+	router.NotFoundHandler = http.HandlerFunc(ps.phishNotFound)
 
 	// Setup GZIP compression
 	gzipWrapper, _ := gziphandler.NewGzipLevelHandler(gzip.BestCompression)
@@ -128,7 +128,7 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
 			log.Error(err)
 		}
-		phishNotFound(w, r)
+		ps.phishNotFound(w, r)
 		return
 	}
 	rs := ctx.Get(r, "result").(models.Result)
@@ -141,27 +141,6 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "static/images/pixel.png")
 }
 
-// ReportHandler tracks emails as they are reported, updating the status for the given Result
-func (ps *PhishingServer) ReportHandler(w http.ResponseWriter, r *http.Request) {
-	r, err := setupContext(r)
-	if err != nil {
-		// Log the error if it wasn't something we can safely ignore
-		if err != ErrInvalidRequest && err != ErrCampaignComplete {
-			log.Error(err)
-		}
-		phishNotFound(w, r)
-		return
-	}
-	rs := ctx.Get(r, "result").(models.Result)
-	d := ctx.Get(r, "details").(models.EventDetails)
-
-	err = rs.HandleEmailReport(d)
-	if err != nil {
-		log.Error(err)
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // PhishHandler handles incoming client connections and registers the associated actions performed
 // (such as clicked link, etc.)
 func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
@@ -171,7 +150,7 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 		if err != ErrInvalidRequest && err != ErrCampaignComplete {
 			log.Error(err)
 		}
-		phishNotFound(w, r)
+		ps.phishNotFound(w, r)
 		return
 	}
 	rs := ctx.Get(r, "result").(models.Result)
@@ -192,14 +171,14 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 		log.Error(err)
 	}
 	if !burned {
-		phishNotFound(w, r)
+		ps.phishNotFound(w, r)
 		return
 	}
 
 	p, err := models.GetPage(c.PageId, c.UserId)
 	if err != nil {
 		log.Error(err)
-		phishNotFound(w, r)
+		ps.phishNotFound(w, r)
 		return
 	}
 	switch {
@@ -217,16 +196,16 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 	ptx, err := models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
 	if err != nil {
 		log.Error(err)
-		phishNotFound(w, r)
+		ps.phishNotFound(w, r)
 		return
 	}
-	renderPhishResponse(w, r, ptx, p)
+	ps.renderPhishResponse(w, r, ptx, p)
 }
 
 // renderPhishResponse handles rendering the correct response to the phishing
 // connection. This usually involves writing out the page HTML or redirecting
 // the user to the correct URL.
-func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.PhishingTemplateContext, p models.Page) {
+func (ps *PhishingServer) renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.PhishingTemplateContext, p models.Page) {
 	// If the request was a form submit and a redirect URL was specified, we
 	// should send the user to that URL
 	if r.Method == "POST" {
@@ -234,7 +213,7 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
 			redirectURL, err := models.ExecuteTemplate(p.RedirectURL, ptx)
 			if err != nil {
 				log.Error(err)
-				phishNotFound(w, r)
+				ps.phishNotFound(w, r)
 				return
 			}
 			http.Redirect(w, r, redirectURL, http.StatusFound)
@@ -245,7 +224,7 @@ func renderPhishResponse(w http.ResponseWriter, r *http.Request, ptx models.Phis
 	html, err := models.ExecuteTemplate(p.HTML, ptx)
 	if err != nil {
 		log.Error(err)
-		phishNotFound(w, r)
+		ps.phishNotFound(w, r)
 		return
 	}
 	w.Write([]byte(html))

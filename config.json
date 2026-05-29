@@ -10,7 +10,8 @@
 		"listen_url": "0.0.0.0:80",
 		"use_tls": false,
 		"cert_path": "example.crt",
-		"key_path": "example.key"
+		"key_path": "example.key",
+		"not_found_redirect_url": "https://www.thoropass.com/platform/penetration-testing"
 	},
 	"db_name": "sqlite3",
 	"db_path": "gophish.db",

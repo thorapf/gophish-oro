@@ -37,7 +37,6 @@ import (
 	"github.com/gophish/gophish/config"
 	"github.com/gophish/gophish/controllers"
 	"github.com/gophish/gophish/dialer"
-	"github.com/gophish/gophish/imap"
 	log "github.com/gophish/gophish/logger"
 	"github.com/gophish/gophish/middleware"
 	"github.com/gophish/gophish/models"
@@ -120,10 +119,8 @@ func main() {
 	phishConfig := conf.PhishConf
 	phishServer := controllers.NewPhishingServer(phishConfig)
 
-	imapMonitor := imap.NewMonitor()
 	if *mode == "admin" || *mode == "all" {
 		go adminServer.Start()
-		go imapMonitor.Start()
 	}
 	if *mode == "phish" || *mode == "all" {
 		go phishServer.Start()
@@ -136,7 +133,6 @@ func main() {
 	log.Info("CTRL+C Received... Gracefully shutting down servers")
 	if *mode == modeAdmin || *mode == modeAll {
 		adminServer.Shutdown()
-		imapMonitor.Shutdown()
 	}
 	if *mode == modePhish || *mode == modeAll {
 		phishServer.Shutdown()

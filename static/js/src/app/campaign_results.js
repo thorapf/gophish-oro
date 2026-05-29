@@ -42,13 +42,6 @@ var statuses = {
         icon: "fa-exclamation",
         point: "ct-point-clicked"
     },
-    //not a status, but is used for the campaign timeline and user timeline
-    "Email Reported": {
-        color: "#45d6ef",
-        label: "label-info",
-        icon: "fa-bullhorn",
-        point: "ct-point-reported"
-    },
     "Error": {
         color: "#6c7a89",
         label: "label-default",
@@ -102,7 +95,6 @@ var statusMapping = {
     "Email Opened": "opened",
     "Clicked Link": "clicked",
     "Submitted Data": "submitted_data",
-    "Email Reported": "reported",
 }
 
 // This is an underwhelming attempt at an enum
@@ -372,8 +364,7 @@ function renderTimeline(data) {
         "email": data[4],
         "position": data[5],
         "status": data[6],
-        "reported": data[7],
-        "send_date": data[8]
+        "send_date": data[7]
     }
     results = '<div class="timeline col-sm-12 well well-lg">' +
         '<h6>Timeline for ' + escapeHtml(record.first_name) + ' ' + escapeHtml(record.last_name) +
@@ -660,9 +651,6 @@ function poll() {
             });
             $.each(campaign.results, function (i, result) {
                 email_series_data[result.status]++;
-                if (result.reported) {
-                    email_series_data['Email Reported']++
-                }
                 // Backfill status values
                 var step = progressListing.indexOf(result.status)
                 for (var i = 0; i < step; i++) {
@@ -697,8 +685,7 @@ function poll() {
                 var rid = rowData[0]
                 $.each(campaign.results, function (j, result) {
                     if (result.id == rid) {
-                        rowData[8] = moment(result.send_date).format('MMMM Do YYYY, h:mm:ss a')
-                        rowData[7] = result.reported
+                        rowData[7] = moment(result.send_date).format('MMMM Do YYYY, h:mm:ss a')
                         rowData[6] = result.status
                         resultsTable.row(i).data(rowData)
                         if (row.child.isShown()) {
@@ -764,26 +751,13 @@ function load() {
                             "targets": [1]
                         }, {
                             "visible": false,
-                            "targets": [0, 8]
+                            "targets": [0, 7]
                         },
                         {
                             "render": function (data, type, row) {
-                                return createStatusLabel(data, row[8])
+                                return createStatusLabel(data, row[7])
                             },
                             "targets": [6]
-                        },
-                        {
-                            className: "text-center",
-                            "render": function (reported, type, row) {
-                                if (type == "display") {
-                                    if (reported) {
-                                        return "<i class='fa fa-check-circle text-center text-success'></i>"
-                                    }
-                                    return "<i role='button' class='fa fa-times-circle text-center text-muted' onclick='report_mail(\"" + row[0] + "\", \"" + campaign.id + "\");'></i>"
-                                }
-                                return reported
-                            },
-                            "targets": [7]
                         }
                     ]
                 });
@@ -802,13 +776,9 @@ function load() {
                         escapeHtml(result.email) || "",
                         escapeHtml(result.position) || "",
                         result.status,
-                        result.reported,
                         moment(result.send_date).format('MMMM Do YYYY, h:mm:ss a')
                     ])
                     email_series_data[result.status]++;
-                    if (result.reported) {
-                        email_series_data['Email Reported']++
-                    }
                     // Backfill status values
                     var step = progressListing.indexOf(result.status)
                     for (var i = 0; i < step; i++) {
@@ -917,48 +887,6 @@ function refresh() {
     clearTimeout(setRefresh)
     setRefresh = setTimeout(refresh, 60000)
 };
-
-function report_mail(rid, cid) {
-    Swal.fire({
-        title: "Are you sure?",
-        text: "This result will be flagged as reported (RID: " + rid + ")",
-        type: "question",
-        animation: false,
-        showCancelButton: true,
-        confirmButtonText: "Continue",
-        confirmButtonColor: "#428bca",
-        reverseButtons: true,
-        allowOutsideClick: false,
-        showLoaderOnConfirm: true
-    }).then(function (result) {
-        if (result.value){
-            api.campaignId.get(cid).success((function(c) {
-                report_url = new URL(c.url)
-                report_url.pathname = '/no'
-                report_url.search = "?id=" + rid
-                fetch(report_url)
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! Status: ${response.status}`);
-                    }
-                    refresh();
-                })
-                .catch(error => {
-                    let errorMessage = error.message;
-                    if (error.message === "Failed to fetch") {
-                        errorMessage = "This might be due to Mixed Content issues or network problems.";
-                    }
-                    Swal.fire({
-                        title: 'Error',
-                        text: errorMessage,
-                        type: 'error',
-                        confirmButtonText: 'Close'
-                    });
-                });
-            }));
-        }
-    })
-}
 
 $(document).ready(function () {
     Highcharts.setOptions({

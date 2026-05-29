@@ -217,18 +217,6 @@ var api = {
             return query("/smtp/" + id, "DELETE", {}, false)
         }
     },
-    // IMAP containts the endpoints for /imap/
-    IMAP: {
-        get: function() {
-            return query("/imap/", "GET", {}, !1)
-        },
-        post: function(e) {
-            return query("/imap/", "POST", e, !1)
-        },
-        validate: function(e) {
-            return query("/imap/validate", "POST", e, true)
-        }
-    },
     // users contains the endpoints for /users
     users: {
         // get() - Queries the API for GET /users

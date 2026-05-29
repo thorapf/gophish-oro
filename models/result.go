@@ -2,8 +2,8 @@ package models
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
-	"math/big"
 	"net"
 	"time"
 
@@ -33,7 +33,6 @@ type Result struct {
 	Latitude          float64   `json:"latitude"`
 	Longitude         float64   `json:"longitude"`
 	SendDate          time.Time `json:"send_date"`
-	Reported          bool      `json:"reported" sql:"not null"`
 	LandingGetServed  bool      `json:"-"`
 	LandingPostServed bool      `json:"-"`
 	ModifiedDate      time.Time `json:"modified_date"`
@@ -137,18 +136,6 @@ func (r *Result) HandleFormSubmit(details EventDetails) error {
 	return db.Save(r).Error
 }
 
-// HandleEmailReport updates a Result in the case where they report a simulated
-// phishing email using the HTTP handler.
-func (r *Result) HandleEmailReport(details EventDetails) error {
-	event, err := r.createEvent(EventReported, details)
-	if err != nil {
-		return err
-	}
-	r.Reported = true
-	r.ModifiedDate = event.Time
-	return db.Save(r).Error
-}
-
 // UpdateGeo updates the latitude and longitude of the result in
 // the database given an IP address
 func (r *Result) UpdateGeo(addr string) error {
@@ -172,17 +159,18 @@ func (r *Result) UpdateGeo(addr string) error {
 	return db.Save(r).Error
 }
 
+// generateResultId returns a 32-character hex UUIDv4 (no hyphens). The
+// underlying randomness comes from crypto/rand with the RFC 4122 version-4
+// and variant bits set. This is independent of the per-email {{.UUID}}
+// template value, which is generated separately at email-send time.
 func generateResultId() (string, error) {
-	const alphaNum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	k := make([]byte, 7)
-	for i := range k {
-		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(alphaNum))))
-		if err != nil {
-			return "", err
-		}
-		k[i] = alphaNum[idx.Int64()]
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
 	}
-	return string(k), nil
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return hex.EncodeToString(b), nil
 }
 
 // GenerateId generates a unique key to represent the result
