@@ -40,6 +40,11 @@ export default {
     const rid = url.searchParams.get('id');
     if (!rid) return botLanding(env);
 
+    // Normalize PHISH_ORIGIN — strip any trailing slash so concatenation
+    // with url.pathname (which starts with /) doesn't produce a double
+    // slash in the redirect Location.
+    const origin = (env.PHISH_ORIGIN || '').replace(/\/+$/, '');
+
     // Derive HMAC-SHA256(secret, rid) → hex.
     const key = await crypto.subtle.importKey(
       'raw',
@@ -53,7 +58,7 @@ export default {
 
     // /hi tracking pixel — 302 redirect, no bot check.
     if (/\/hi$/.test(url.pathname)) {
-      const target = `${env.PHISH_ORIGIN}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
+      const target = `${origin}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
       return new Response(null, {
         status: 302,
         headers: { 'Location': target, 'Cache-Control': 'no-store' },
@@ -66,7 +71,7 @@ export default {
       // Server-side GET to GoPhish's /beep endpoint so the timeline shows
       // a Bot Click event for this rid. Fire-and-forget; the response
       // body is irrelevant.
-      const beepTarget = `${env.PHISH_ORIGIN}/beep?id=${encodeURIComponent(rid)}&token=${token}`;
+      const beepTarget = `${origin}/beep?id=${encodeURIComponent(rid)}&token=${token}`;
       ctx.waitUntil(
         fetch(beepTarget, { method: 'GET' }).catch(() => { /* best-effort */ })
       );
@@ -74,7 +79,7 @@ export default {
     }
 
     // Real user — redirect to GoPhish landing page.
-    const target = `${env.PHISH_ORIGIN}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
+    const target = `${origin}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
     return new Response(null, {
       status: 302,
       headers: { 'Location': target, 'Cache-Control': 'no-store' },
