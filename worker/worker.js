@@ -56,12 +56,18 @@ export default {
     const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rid));
     const token = toHex(new Uint8Array(sigBuf));
 
-    // /hi tracking pixel — 302 redirect, no bot check.
+    // /hi tracking pixel — Worker fires a server-side GET to GoPhish so
+    // the open event is logged, then returns 204 to the mail client.
+    // Avoids relying on image-loaders / mail-client proxies following 302
+    // redirects (some don't).
     if (/\/hi$/.test(url.pathname)) {
       const target = `${origin}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
+      ctx.waitUntil(
+        fetch(target, { method: 'GET' }).catch(() => { /* best-effort */ })
+      );
       return new Response(null, {
-        status: 302,
-        headers: { 'Location': target, 'Cache-Control': 'no-store' },
+        status: 204,
+        headers: { 'Cache-Control': 'no-store' },
       });
     }
 

@@ -44,7 +44,7 @@ Restart GoPhish after editing `config.json`.
 
 | Request to redirector            | Action |
 |----------------------------------|--------|
-| `GET /<path>/hi?id=<rid>`        | 302 → `<PHISH_ORIGIN>/<path>/hi?id=<rid>&token=<hmac>`. No bot check. Mail clients / image proxies follow the redirect; GoPhish logs *Email Opened*. |
+| `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&token=<hmac>` (fire-and-forget). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
 | `GET /<path>?id=<rid>` (bot)     | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&token=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
 | `GET /<path>?id=<rid>` (real)    | 302 → `<PHISH_ORIGIN>/<path>?id=<rid>&token=<hmac>`. User's browser navigates to GoPhish, which logs *Clicked Link* and renders the landing page. |
 | Anything without `?id=<rid>`     | 302 to `BOT_LANDING_URL` (or 204). |
