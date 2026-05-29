@@ -11,7 +11,14 @@
 		"use_tls": false,
 		"cert_path": "example.crt",
 		"key_path": "example.key",
-		"not_found_redirect_url": "https://www.thoropass.com/platform/penetration-testing"
+		"not_found_redirect_url": "https://www.thoropass.com/platform/penetration-testing",
+		"redirector": {
+			"allowed_referer": [
+				"redirector.example.com",
+				"phish.example.com"
+			],
+			"bot_ua": "Redirector-Bot"
+		}
 	},
 	"db_name": "sqlite3",
 	"db_path": "gophish.db",

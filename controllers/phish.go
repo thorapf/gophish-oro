@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -84,16 +86,41 @@ func (ps *PhishingServer) Shutdown() error {
 
 // phishNotFound is the dead-end response handler. If a not_found_redirect_url
 // is configured under phish_server, every dead-end request (invalid rid,
-// missing rid, burnt rid, completed campaign, unmatched route, etc.) is
-// 302-redirected there so a casual visitor or scanner sees a benign page
-// instead of a 404 fingerprint. If the config field is empty, the original
-// 404 behavior is preserved.
+// missing rid, burnt rid, completed campaign, unmatched route, failed
+// referer check, etc.) is 302-redirected there so a casual visitor or
+// scanner sees a benign page instead of a 404 fingerprint. If the config
+// field is empty, the original 404 behavior is preserved.
 func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) {
 	if ps.config.NotFoundRedirectURL != "" {
 		http.Redirect(w, r, ps.config.NotFoundRedirectURL, http.StatusFound)
 		return
 	}
 	http.NotFound(w, r)
+}
+
+// refererAllowed parses the request's Referer header and returns true iff the
+// hostname matches one of the redirector.allowed_referer entries (case
+// insensitive). Empty list or unparseable / missing Referer → false, which
+// means strict-deny by default.
+func (ps *PhishingServer) refererAllowed(r *http.Request) bool {
+	ref := r.Header.Get("Referer")
+	if ref == "" {
+		return false
+	}
+	u, err := url.Parse(ref)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	for _, allowed := range ps.config.Redirector.AllowedReferer {
+		if strings.EqualFold(host, allowed) {
+			return true
+		}
+	}
+	return false
 }
 
 // CreatePhishingRouter creates the router that handles phishing connections.
@@ -156,6 +183,31 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 	rs := ctx.Get(r, "result").(models.Result)
 	c := ctx.Get(r, "campaign").(models.Campaign)
 	d := ctx.Get(r, "details").(models.EventDetails)
+
+	// HEAD method is the redirector's bot-ping path. It bypasses the referer
+	// check (no browser navigation involved) and never burns the rid. A
+	// "Bot Click" event is only recorded when the request's User-Agent
+	// matches the configured redirector.bot_ua; HEAD with any other UA is a
+	// silent 200 so probes don't create noise in the timeline.
+	if r.Method == http.MethodHead {
+		botUA := ps.config.Redirector.BotUA
+		if botUA != "" && r.Header.Get("User-Agent") == botUA {
+			if err := rs.HandleBotClick(d); err != nil {
+				log.Error(err)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Referer gate for GET / POST. Every request that would render or
+	// process the landing page must come through a known redirector
+	// hostname; the rid one-shot guard provides replay protection, the
+	// referer check provides the "no direct access" property.
+	if !ps.refererAllowed(r) {
+		ps.phishNotFound(w, r)
+		return
+	}
 
 	// One-shot guard: at most one GET and one POST per rid. The burn is an
 	// atomic conditional UPDATE, so concurrent requests for the same rid can

@@ -60,6 +60,12 @@ var statuses = {
         icon: "fa-exclamation",
         point: "ct-point-clicked"
     },
+    "Bot Click": {
+        color: "#999999",
+        label: "label-default",
+        icon: "fa-android",
+        point: "ct-point-bot"
+    },
     "Unknown": {
         color: "#6c7a89",
         label: "label-default",

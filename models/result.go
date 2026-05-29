@@ -124,6 +124,17 @@ func (r *Result) HandleClickedLink(details EventDetails) error {
 	return db.Save(r).Error
 }
 
+// HandleBotClick records a "Bot Click" event for a result. This is fired by
+// the upstream redirector when it has detected an automated visitor (email
+// link sandbox, scanner, etc.) and is *not* a state transition on the
+// underlying Result: Status, modification date, and the GET/POST burn flags
+// are left unchanged. Only an event row is appended so the admin timeline
+// shows the probe attempt separately from genuine user activity.
+func (r *Result) HandleBotClick(details EventDetails) error {
+	_, err := r.createEvent(EventBotClick, details)
+	return err
+}
+
 // HandleFormSubmit updates a Result in the case where the recipient submitted
 // credentials to the form on a Landing Page.
 func (r *Result) HandleFormSubmit(details EventDetails) error {

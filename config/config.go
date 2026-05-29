@@ -18,13 +18,24 @@ type AdminServer struct {
 	TrustedOrigins       []string `json:"trusted_origins"`
 }
 
+// RedirectorConfig describes the upstream redirector (e.g. a Cloudflare
+// Worker) that gates access to the phishing server. AllowedReferer is the
+// list of hostnames whose Referer values are accepted; BotUA is the
+// User-Agent the redirector uses on its HEAD ping when it has detected a
+// bot.
+type RedirectorConfig struct {
+	AllowedReferer []string `json:"allowed_referer"`
+	BotUA          string   `json:"bot_ua"`
+}
+
 // PhishServer represents the Phish server configuration details
 type PhishServer struct {
-	ListenURL           string `json:"listen_url"`
-	UseTLS              bool   `json:"use_tls"`
-	CertPath            string `json:"cert_path"`
-	KeyPath             string `json:"key_path"`
-	NotFoundRedirectURL string `json:"not_found_redirect_url"`
+	ListenURL           string           `json:"listen_url"`
+	UseTLS              bool             `json:"use_tls"`
+	CertPath            string           `json:"cert_path"`
+	KeyPath             string           `json:"key_path"`
+	NotFoundRedirectURL string           `json:"not_found_redirect_url"`
+	Redirector          RedirectorConfig `json:"redirector"`
 }
 
 // Config represents the configuration information.
