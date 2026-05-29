@@ -161,8 +161,16 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rs := ctx.Get(r, "result").(models.Result)
-	d := ctx.Get(r, "details").(models.EventDetails)
 
+	// Once the landing page has been served (or the form submitted), a
+	// subsequent open-tracking request is stale. Treat it like an invalid
+	// rid: no event, dead-end response.
+	if rs.LandingGetServed || rs.LandingPostServed {
+		ps.phishNotFound(w, r)
+		return
+	}
+
+	d := ctx.Get(r, "details").(models.EventDetails)
 	err = rs.HandleEmailOpened(d)
 	if err != nil {
 		log.Error(err)
@@ -175,7 +183,8 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 // /beep?id=<rid>&token=<hmac> when it has decided the visitor is a bot.
 // On valid token, gophish appends a "Bot Click" event to the result's
 // timeline; it never burns the rid, never renders anything, and returns
-// 200 with no body.
+// 200 with no body. Once the landing page has been served, further bot
+// pings are stale and treated as invalid.
 func (ps *PhishingServer) BeepHandler(w http.ResponseWriter, r *http.Request) {
 	if !ps.tokenValid(r) {
 		ps.phishNotFound(w, r)
@@ -190,6 +199,14 @@ func (ps *PhishingServer) BeepHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rs := ctx.Get(r, "result").(models.Result)
+
+	// Don't log post-burn bot pings; the rid is already past its useful
+	// life-cycle stage and any bot probe at this point is just noise.
+	if rs.LandingGetServed || rs.LandingPostServed {
+		ps.phishNotFound(w, r)
+		return
+	}
+
 	d := ctx.Get(r, "details").(models.EventDetails)
 	if err := rs.HandleBotClick(d); err != nil {
 		log.Error(err)
