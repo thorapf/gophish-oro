@@ -45,13 +45,16 @@ Restart GoPhish after editing `config.json`.
 | Request to redirector            | Action |
 |----------------------------------|--------|
 | `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&token=<hmac>` (fire-and-forget). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
-| `GET /<path>?id=<rid>` (bot)     | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&token=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
-| `GET /<path>?id=<rid>` (real)    | 302 → `<PHISH_ORIGIN>/<path>?id=<rid>&token=<hmac>`. User's browser navigates to GoPhish, which logs *Clicked Link* and renders the landing page. |
+| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&token=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
+| `GET /<path>?id=<rid>` (layer-1 pass)| Worker serves a visually-blank HTML page with an embedded JS challenge that runs `navigator.webdriver` / plugin / WebGL / screen checks and POSTs the result to `/__verify`. |
+| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&token=<hmac>` and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns 403. |
 | Anything without `?id=<rid>`     | 302 to `BOT_LANDING_URL` (or 204). |
 
-## Bot detection signals (no captcha, no JS challenge)
+## Bot detection — two layers
 
-Any one of these flags the request as a bot:
+### Layer 1: request-time heuristics (cheap, no JS)
+
+Any one of these flags the request as a bot before any HTML is served:
 
 1. **User-Agent regex** — `curl`, `wget`, `python-requests`, `HeadlessChrome`,
    `Puppeteer`, common scanner names (`Pingdom`, `Mimecast`, `ProofPoint`,
@@ -67,6 +70,39 @@ Any one of these flags the request as a bot:
 
 Edit the `BOT_UA_RE` regex and `BLOCKED_ASNS` set inside `worker.js` to tune
 for your engagement.
+
+### Layer 2: invisible JS challenge
+
+After layer 1 passes, the Worker serves a tiny HTML page that's visually
+blank. An embedded script runs immediately and collects:
+
+- `navigator.webdriver` (set by Selenium / Puppeteer / Playwright defaults)
+- `navigator.plugins.length` and `navigator.languages.length`
+- `navigator.hardwareConcurrency`
+- `window.screen.width / height`
+- Canvas fingerprint (last 32 chars of `toDataURL()`)
+- WebGL unmasked renderer (catches "SwiftShader", "llvmpipe", "Mesa", etc.)
+
+The signals are POSTed back to the Worker's `/__verify` endpoint. The
+Worker evaluates and either returns the GoPhish target URL (with the
+HMAC token) on pass, or fires the `/beep` event and returns 403. The
+embedded JS does `location.replace(target)` on success; on any failure
+or error, the page just stays blank.
+
+What this catches that layer 1 doesn't:
+
+- Headless Chrome / Puppeteer / Selenium running on residential IPs.
+- Real-Chrome scanners with all the right headers but bot-shaped JS env.
+- Tools that don't execute JS at all (the page stays blank, no redirect).
+
+What it doesn't catch:
+
+- A human analyst manually clicking the link on their workstation.
+- Bot frameworks specifically tuned to evade these checks (uncommon for
+  general-purpose scanners).
+
+There's no captcha and no visible "verifying browser" message. Real
+users see a blank page for ~200–500ms while JS runs and redirects.
 
 ## Landing page authoring (one rule)
 
