@@ -2,12 +2,21 @@
 
 A single-file Cloudflare Worker that gates access to a GoPhish phishing
 server. Filters bots and email-link sandboxes; passes real users through
-to GoPhish. Authentication to GoPhish is via a time-bound signed URL:
-the Worker appends `&exp=<unix>&sig=<hmac>` where
-`sig = HMAC-SHA256(secret, id + "." + exp)`, using a shared secret known
-to both this Worker and GoPhish. GoPhish recomputes the signature and
-serves the landing page only while `now < exp` (60-second window). After
-that it bounces the visitor back to this Worker for re-verification.
+to GoPhish. Authentication to GoPhish is via an **IP-bound signed URL**:
+after the bot checks pass, the Worker appends `&sig=<hmac>` where
+`sig = HMAC-SHA256(secret, id + "." + CF-Connecting-IP)`, using a shared
+secret known to both this Worker and GoPhish. Because both sit behind
+Cloudflare, GoPhish sees the same client IP in the `CF-Connecting-IP`
+header and recomputes an identical signature. There is **no expiry**: a
+visitor reloading from the same IP is served indefinitely, while the same
+URL replayed from any other network — a Safe Browsing verification crawl,
+a mail scanner, an analyst on a different box — computes a different IP,
+fails the signature, and is dead-ended to `<PHISH_ORIGIN>/404`.
+
+The server-side-fetched `/hi` and `/beep` endpoints are signed against the
+id alone (`sig = HMAC-SHA256(secret, id)`), because the Worker — not the
+target's browser — issues those requests, so the IP GoPhish sees on them is
+the Worker's, not the visitor's.
 
 ## Deployment (no wrangler, no CLI)
 
@@ -42,10 +51,10 @@ Restart GoPhish after editing `config.json`.
 
 | Request to redirector            | Action |
 |----------------------------------|--------|
-| `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&exp=<unix>&sig=<hmac>` (fire-and-forget). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
-| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&exp=<unix>&sig=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `<PHISH_ORIGIN>/404`. |
+| `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&sig=<hmac>` (fire-and-forget; `sig` over the id alone). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
+| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&sig=<hmac>` (`sig` over the id alone) so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `<PHISH_ORIGIN>/404`. |
 | `GET /<path>?id=<rid>` (layer-1 pass)| Worker serves a visually-blank HTML page with an embedded JS challenge that runs `navigator.webdriver` / plugin / WebGL / screen checks and POSTs the result to `/__verify`. |
-| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&exp=<unix>&sig=<hmac>` and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns `{target: <PHISH_ORIGIN>/404}` so the page redirects there. |
+| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&sig=<hmac>` where `sig = HMAC(secret, id + "." + CF-Connecting-IP)`, and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns `{target: <PHISH_ORIGIN>/404}` so the page redirects there. |
 | Anything without `?id=<rid>`     | 302 to `<PHISH_ORIGIN>/404`. |
 
 `<PHISH_ORIGIN>/404` has no dedicated route on GoPhish: the catch-all sees
@@ -53,11 +62,19 @@ no valid signature and forwards to GoPhish's `not_found_redirect_url`. So
 every dead-end — no id, bad path, or detected bot — funnels through GoPhish
 to a single benign destination.
 
-The signed URL is valid for 60 seconds (`TOKEN_TTL_SECONDS` in `worker.js`).
-If a real user takes longer than that to submit the login form, GoPhish
-bounces them back here, the JS challenge runs again, and they get a fresh
-60-second window with the form re-served. There is no per-rid burn — a rid
-stays usable for the whole campaign; only individual signed URLs expire.
+There is no expiry and no per-rid burn. The signed landing URL stays valid
+for as long as the visitor keeps the same `CF-Connecting-IP`, so reloads and
+slow form submissions just work without any round trip back through the
+Worker. If the visitor's egress IP changes (e.g. a mobile network handoff),
+the old signed URL stops validating and dead-ends to `<PHISH_ORIGIN>/404`;
+re-clicking the original campaign link routes back through the Worker, which
+re-runs the bot checks and mints a fresh IP-bound URL.
+
+> **Note on IPv6:** the signature binds to the exact `CF-Connecting-IP`
+> string. IPv6 privacy-extension addresses can rotate within a prefix
+> mid-session; if you see legitimate IPv6 targets dead-ending on reload,
+> normalize the IP to its `/64` prefix identically in both `worker.js`
+> (`signedParamsIP`) and gophish (`clientIP`) before hashing.
 
 ## Bot detection — two layers
 
@@ -93,10 +110,10 @@ blank. An embedded script runs immediately and collects:
 - WebGL unmasked renderer (catches "SwiftShader", "llvmpipe", "Mesa", etc.)
 
 The signals are POSTed back to the Worker's `/__verify` endpoint. The
-Worker evaluates and either returns the GoPhish target URL (with the
-HMAC token) on pass, or fires the `/beep` event and returns 403. The
-embedded JS does `location.replace(target)` on success; on any failure
-or error, the page just stays blank.
+Worker evaluates and either returns the IP-bound GoPhish target URL on
+pass, or fires the `/beep` event and returns `{target: <PHISH_ORIGIN>/404}`.
+The embedded JS does `location.replace(target)` either way; on a fail it
+simply lands on the benign not-found destination.
 
 What this catches that layer 1 doesn't:
 
@@ -119,7 +136,8 @@ Form POSTs inherit the token from the document URL only if the form's
 `action` attribute is empty or absent:
 
 ```html
-<!-- correct: POST goes back to the same URL, which already has &token= -->
+<!-- correct: POST goes back to the same URL, which already has &sig= and is
+     from the same browser/IP, so the IP-bound signature validates -->
 <form method="POST">
    ...
 </form>
@@ -130,13 +148,13 @@ Form POSTs inherit the token from the document URL only if the form's
 </form>
 
 <!-- wrong: action="{{.URL}}" expands to the redirector hostname without
-     a token, so GoPhish will reject the POST -->
+     a signature, so GoPhish will reject the POST -->
 <form method="POST" action="{{.URL}}">
 ```
 
 If you have existing campaign Page HTML that uses `action="{{.URL}}"`, edit
 it to drop the action attribute. Otherwise form submissions land at
-GoPhish without a token and dead-end to `not_found_redirect_url`.
+GoPhish without a signature and dead-end to `not_found_redirect_url`.
 
 ## Verifying the setup
 

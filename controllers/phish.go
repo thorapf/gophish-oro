@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -100,42 +99,63 @@ func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) 
 	http.NotFound(w, r)
 }
 
-// validateSignature checks the time-bound signed-URL parameters the
-// redirector appends to every gophish-bound link:
-//
-//	?id=<rid>&exp=<unix-seconds>&sig=<hex HMAC-SHA256(secret, rid "." exp)>
-//
-// It returns (sigOK, expired). sigOK is true only when the recomputed HMAC
-// matches the provided sig in constant time (which also proves exp is
-// intact, since exp is part of the signed message). expired is true when
-// the signature is valid but the current time has passed exp. An empty
-// configured secret means strict-deny (sigOK=false).
-func (ps *PhishingServer) validateSignature(r *http.Request) (sigOK bool, expired bool) {
+// clientIP returns the visitor's IP exactly as Cloudflare presents it in the
+// CF-Connecting-IP header. The redirector signs against this same header
+// value, and because both the redirector and gophish sit behind Cloudflare,
+// gophish receives the identical client IP here.
+func clientIP(r *http.Request) string {
+	return r.Header.Get("CF-Connecting-IP")
+}
+
+// signatureMatches reports whether the ?id and ?sig query parameters carry a
+// valid HMAC-SHA256(secret, msg) signature, compared in constant time. An
+// empty configured secret means strict-deny (false). There is no expiry: a
+// signature is either valid or it is not.
+func (ps *PhishingServer) signatureMatches(r *http.Request, msg string) bool {
 	q := r.URL.Query()
 	rid := q.Get(models.RecipientParameter)
-	exp := q.Get("exp")
 	sig := q.Get("sig")
-	if rid == "" || exp == "" || sig == "" {
-		return false, false
+	if rid == "" || sig == "" {
+		return false
 	}
 	secret, err := hex.DecodeString(ps.config.Redirector.Secret)
 	if err != nil || len(secret) == 0 {
-		return false, false
+		return false
 	}
 	h := hmac.New(sha256.New, secret)
-	h.Write([]byte(rid + "." + exp))
+	h.Write([]byte(msg))
 	expected := hex.EncodeToString(h.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(sig)) {
-		return false, false
-	}
-	expUnix, err := strconv.ParseInt(exp, 10, 64)
-	if err != nil {
-		return false, false
-	}
-	if time.Now().Unix() >= expUnix {
-		return true, true
-	}
-	return true, false
+	return hmac.Equal([]byte(expected), []byte(sig))
+}
+
+// validateSignature validates the id-bound signature the redirector appends to
+// the server-side-fetched /hi and /beep endpoints:
+//
+//	?id=<rid>&sig=<hex HMAC-SHA256(secret, rid)>
+//
+// These are fetched by the redirector itself (not the visitor's browser), so
+// the connecting IP gophish sees is the redirector's, not the target's — hence
+// they are bound to the rid alone, not the IP.
+func (ps *PhishingServer) validateSignature(r *http.Request) bool {
+	rid := r.URL.Query().Get(models.RecipientParameter)
+	return ps.signatureMatches(r, rid)
+}
+
+// validateClickSignature validates the IP-bound signature used for the landing
+// page:
+//
+//	?id=<rid>&sig=<hex HMAC-SHA256(secret, rid "." CF-Connecting-IP)>
+//
+// The redirector mints this against the visitor's CF-Connecting-IP after the
+// bot checks pass. gophish recomputes it against the IP it sees in the same
+// header. A request replayed from any other network — most importantly a Safe
+// Browsing verification crawl from Google infrastructure — computes a
+// different IP, fails the comparison, and is dead-ended to the configured
+// not-found URL. There is no expiry, so a target reloading from the same IP is
+// served indefinitely without a round trip back through the redirector.
+func (ps *PhishingServer) validateClickSignature(r *http.Request) bool {
+	rid := r.URL.Query().Get(models.RecipientParameter)
+	return ps.signatureMatches(r, rid+"."+clientIP(r))
 }
 
 // CreatePhishingRouter creates the router that handles phishing connections.
@@ -166,10 +186,9 @@ func (ps *PhishingServer) registerRoutes() {
 
 // TrackHandler tracks emails as they are opened, updating the status for the given Result
 func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
-	// /hi is fetched server-side by the redirector immediately after signing,
-	// so a valid signature is always fresh here; an expired one is treated as
-	// invalid (no bounce, no event).
-	if ok, expired := ps.validateSignature(r); !ok || expired {
+	// /hi is fetched server-side by the redirector, which signs it against the
+	// rid alone (the connecting IP here is the redirector's, not the target's).
+	if !ps.validateSignature(r) {
 		ps.phishNotFound(w, r)
 		return
 	}
@@ -193,13 +212,12 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 
 // BeepHandler is the upstream redirector's bot-detection signal endpoint.
 // Cloudflare Worker (or any redirector) makes a server-side GET to
-// /beep?id=<rid>&exp=<exp>&sig=<sig> when it has decided the visitor is a
-// bot. On a valid, fresh signature, gophish appends a "Bot Click" event to
-// the result's timeline; it never renders anything and returns 200 with no
-// body. Fetched server-side immediately after signing, so an expired
-// signature is treated as invalid.
+// /beep?id=<rid>&sig=<sig> when it has decided the visitor is a bot. On a
+// valid signature, gophish appends a "Bot Click" event to the result's
+// timeline; it never renders anything and returns 200 with no body. Fetched
+// server-side by the redirector, so it is signed against the rid alone.
 func (ps *PhishingServer) BeepHandler(w http.ResponseWriter, r *http.Request) {
-	if ok, expired := ps.validateSignature(r); !ok || expired {
+	if !ps.validateSignature(r) {
 		ps.phishNotFound(w, r)
 		return
 	}
@@ -222,9 +240,11 @@ func (ps *PhishingServer) BeepHandler(w http.ResponseWriter, r *http.Request) {
 // PhishHandler handles incoming client connections and registers the associated actions performed
 // (such as clicked link, etc.)
 func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
-	sigOK, expired := ps.validateSignature(r)
-	if !sigOK {
-		// Bad/missing signature: dead-end to the configured not-found URL.
+	if !ps.validateClickSignature(r) {
+		// Bad/missing/IP-mismatched signature: dead-end to the configured
+		// not-found URL. A signature minted by the redirector for one visitor
+		// IP will not validate for any other network, so a replayed or crawled
+		// URL lands here.
 		ps.phishNotFound(w, r)
 		return
 	}
@@ -240,22 +260,6 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 	rs := ctx.Get(r, "result").(models.Result)
 	c := ctx.Get(r, "campaign").(models.Campaign)
 	d := ctx.Get(r, "details").(models.EventDetails)
-
-	// Valid signature but past its 60-second window: bounce the visitor back
-	// to the redirector (the campaign's templated URL with ?id=<rid>). The
-	// redirector re-runs its checks and, for a human, mints a fresh signed
-	// URL. An in-flight POST loses its body here, which is acceptable: the
-	// user simply re-submits the freshly served form.
-	if expired {
-		ptx, err := models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
-		if err != nil {
-			log.Error(err)
-			ps.phishNotFound(w, r)
-			return
-		}
-		http.Redirect(w, r, ptx.URL, http.StatusFound)
-		return
-	}
 
 	p, err := models.GetPage(c.PageId, c.UserId)
 	if err != nil {
