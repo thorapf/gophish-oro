@@ -203,49 +203,317 @@ const HOLD_MS = 1200;
 
 function pressHoldHTML(rid) {
   const ridJSON = JSON.stringify(rid);
-  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">` +
-    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
-    `<meta name="robots" content="noindex,nofollow"><title>Verifying…</title>` +
-    `<style>` +
-      `*{box-sizing:border-box}html,body{height:100%;margin:0}` +
-      `body{display:flex;align-items:center;justify-content:center;background:#f5f6f8;color:#1f2328;` +
-        `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}` +
-      `.card{width:min(92vw,360px);background:#fff;border:1px solid #e4e6eb;border-radius:12px;` +
-        `padding:28px 24px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}` +
-      `.title{font-size:16px;font-weight:600;margin:0 0 6px}` +
-      `.sub{font-size:13px;color:#6b7280;margin:0 0 22px}` +
-      `.btn{position:relative;width:100%;height:46px;border:0;border-radius:8px;cursor:pointer;` +
-        `font-size:14px;font-weight:600;color:#fff;background:#2563eb;overflow:hidden;` +
-        `user-select:none;-webkit-user-select:none;touch-action:none}` +
-      `.btn:disabled{cursor:default;opacity:.9}` +
-      `.fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.28)}` +
-      `.label{position:relative;z-index:1}` +
-    `</style></head><body>` +
-    `<div class="card">` +
-      `<p class="title">Confirming your browser</p>` +
-      `<p class="sub">Press and hold the button to continue.</p>` +
-      `<button class="btn" id="b"><span class="fill" id="f"></span><span class="label" id="l">Press &amp; Hold</span></button>` +
-    `</div>` +
-    `<script>(function(){` +
-      `var HOLD=${HOLD_MS},b=document.getElementById('b'),f=document.getElementById('f'),l=document.getElementById('l');` +
-      `var start=0,raf=0,done=false;` +
-      `function reset(){start=0;if(raf){cancelAnimationFrame(raf);raf=0;}f.style.width='0';}` +
-      `function tick(){if(!start)return;var p=Math.min(1,(Date.now()-start)/HOLD);f.style.width=(p*100)+'%';` +
-        `if(p>=1){finish();}else{raf=requestAnimationFrame(tick);}}` +
-      `function hold(e){e.preventDefault();if(done)return;start=Date.now();raf=requestAnimationFrame(tick);}` +
-      `function release(){if(done)return;reset();}` +
-      `async function finish(){if(done)return;done=true;if(raf){cancelAnimationFrame(raf);raf=0;}` +
-        `f.style.width='100%';l.textContent='Verifying…';b.disabled=true;` +
-        `try{var r=await fetch('/__verify?id='+encodeURIComponent(${ridJSON}),{` +
-          `method:'POST',headers:{'Content-Type':'application/json'},` +
-          `body:JSON.stringify({path:location.pathname})});` +
-          `if(r.ok){var d=await r.json();if(d&&d.target){location.replace(d.target);return;}}` +
-        `}catch(e){}` +
-        `done=false;b.disabled=false;l.textContent='Try again';reset();}` +
-      `b.addEventListener('pointerdown',hold);` +
-      `b.addEventListener('pointerup',release);` +
-      `b.addEventListener('pointerleave',release);` +
-      `b.addEventListener('pointercancel',release);` +
-      `b.addEventListener('contextmenu',function(e){e.preventDefault();});` +
-    `})();</script></body></html>`;
+  return `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex,nofollow">
+<title>Before we continue…</title>
+<style>
+:root {
+  --color-primary-10:  #E9F5FF;
+  --color-primary-20:  #D3EAFF;
+  --color-primary-60:  #50A6F7;
+  --color-primary-100: #0F69BD;
+  --color-primary-140: #004483;
+  --color-primary-160: #002D57;
+
+  --color-secondary-20: #E3FBDA;
+  --color-secondary-60: #AAED93;
+
+  --color-neutral-00:  #FFFFFF;
+  --color-neutral-05:  #F2F3F3;
+  --color-neutral-10:  #E6E7E8;
+  --color-neutral-20:  #CCCFD0;
+  --color-neutral-40:  #999EA1;
+  --color-neutral-50:  #80868A;
+  --color-neutral-60:  #666E72;
+  --color-neutral-70:  #4D565B;
+  --color-neutral-80:  #333D43;
+  --color-neutral-100: #000D14;
+
+  --color-success-100: #227007;
+
+  --fg-1: var(--color-neutral-100);
+  --fg-2: var(--color-neutral-70);
+  --fg-3: var(--color-neutral-60);
+
+  --bg-1: var(--color-neutral-00);
+  --bg-2: var(--color-neutral-05);
+
+  --interactive: var(--color-primary-100);
+  --focus-ring: color-mix(in srgb, var(--color-primary-100) 45%, transparent);
+
+  --radius-full: 9999px;
+
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --font-sans: "Noto Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  --text-h4-size: 24px;   --text-h4-lh: 32px;
+  --text-body-size: 16px; --text-body-lh: 24px;
+  --text-body2-size: 14px;--text-body2-lh: 20px; --text-body2-weight: 400;
+
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 280ms;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; }
+html, body {
+  font-family: var(--font-sans);
+  color: var(--fg-1);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+body {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: var(--space-8);
+  background: var(--color-neutral-00);
+  color: var(--fg-1);
+}
+
+.frame {
+  width: 100%;
+  max-width: 300px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+
+.intro h1 {
+  font: 700 var(--text-h4-size)/var(--text-h4-lh) var(--font-sans);
+  margin: 0 0 var(--space-3) 0;
+  color: var(--color-neutral-80);
+  letter-spacing: -0.01em;
+}
+.intro p {
+  margin: 0 0 var(--space-8) 0;
+  font: var(--text-body2-weight) var(--text-body2-size)/var(--text-body2-lh) var(--font-sans);
+  color: var(--fg-3);
+  text-wrap: balance;
+}
+
+.hold {
+  --pill-border: color-mix(in srgb, var(--color-primary-60) 42%, var(--color-neutral-20));
+  position: relative;
+  width: 100%;
+  padding: var(--space-3) var(--space-6);
+  border: 1.5px solid var(--pill-border);
+  border-radius: var(--radius-full);
+  background: var(--color-neutral-00);
+  font-family: var(--font-sans);
+  cursor: pointer;
+  overflow: hidden;
+  isolation: isolate;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+  transition: border-color var(--dur-base) var(--ease-standard),
+              box-shadow var(--dur-base) var(--ease-standard),
+              transform var(--dur-fast) var(--ease-standard);
+}
+.hold:hover { border-color: var(--color-primary-60); }
+.hold:focus-visible {
+  outline: none;
+  border-color: var(--interactive);
+  box-shadow: 0 0 0 3px var(--focus-ring);
+}
+.hold[data-state="holding"] { border-color: var(--interactive); }
+.hold[data-state="verified"] {
+  border-color: var(--color-secondary-60);
+  cursor: default;
+}
+.hold[data-state="verifying"] { cursor: progress; }
+
+.fill {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  background: var(--color-primary-10);
+  z-index: -1;
+}
+.hold[data-state="early"] .fill { transition: width var(--dur-slow) var(--ease-exit); }
+.hold[data-state="verified"] .fill,
+.hold[data-state="verifying"] .fill { background: var(--color-secondary-20); }
+
+.hold-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font: 600 var(--text-body-size)/var(--text-body-lh) var(--font-sans);
+  color: var(--interactive);
+  transition: color var(--dur-base) var(--ease-standard);
+}
+.hold[data-state="verified"] .hold-label { color: var(--color-success-100); }
+
+.tick {
+  width: 18px; height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  display: none;
+}
+.hold[data-state="verified"] .tick { display: inline-block; }
+.tick path { stroke-dasharray: 24; stroke-dashoffset: 24; }
+.hold[data-state="verified"] .tick path {
+  transition: stroke-dashoffset var(--dur-slow) var(--ease-standard) 60ms;
+  stroke-dashoffset: 0;
+}
+
+.spin {
+  width: 16px; height: 16px;
+  border: 2px solid var(--color-primary-20);
+  border-top-color: var(--interactive);
+  border-radius: var(--radius-full);
+  display: none;
+  animation: spin 0.7s linear infinite;
+}
+.hold[data-state="verifying"] .spin { display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .spin { animation-duration: 1.2s; }
+}
+</style>
+</head>
+<body>
+  <main class="frame">
+    <div class="intro">
+      <h1>Before we continue...</h1>
+      <p>Press &amp; Hold to confirm you are a human (and not a bot).</p>
+    </div>
+
+    <button type="button" class="hold" id="check" aria-label="Press and hold to confirm you are a human" data-state="idle">
+      <span class="fill" id="fill" aria-hidden="true"></span>
+      <span class="hold-label">
+        <span class="spin" aria-hidden="true"></span>
+        <svg class="tick" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12.5l4.2 4.2L19 7"></path></svg>
+        <span id="leadText">Press &amp; Hold</span>
+      </span>
+    </button>
+  </main>
+
+<script>
+(function () {
+  var RID = ${ridJSON};
+  var HOLD_MS = ${HOLD_MS};
+
+  var btn = document.getElementById('check');
+  var fill = document.getElementById('fill');
+  var lead = document.getElementById('leadText');
+
+  var state = 'idle';
+  var holding = false;
+  var rafId = null;
+  var startTs = 0;
+  var progress = 0;
+  var earlyTimer = null;
+
+  function setFill(p) {
+    progress = Math.max(0, Math.min(1, p));
+    fill.style.width = (progress * 100).toFixed(2) + '%';
+  }
+  function setState(s) { state = s; btn.setAttribute('data-state', s); }
+
+  function tick(ts) {
+    if (!holding) return;
+    if (!startTs) startTs = ts;
+    setFill((ts - startTs) / HOLD_MS);
+    if (progress >= 1) { complete(); return; }
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function startHold() {
+    if (state === 'verified' || state === 'verifying' || holding) return;
+    if (earlyTimer) { clearTimeout(earlyTimer); earlyTimer = null; }
+    holding = true;
+    startTs = 0;
+    setState('holding');
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function cancelHold() {
+    if (!holding) return;
+    holding = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    setState('early');
+    setFill(0);
+    if (earlyTimer) clearTimeout(earlyTimer);
+    earlyTimer = setTimeout(function () {
+      if (state === 'early') { setState('idle'); lead.textContent = 'Press & Hold'; }
+    }, 600);
+  }
+
+  function complete() {
+    holding = false;
+    if (rafId) cancelAnimationFrame(rafId);
+    setFill(1);
+    setState('verifying');
+    lead.textContent = 'Verifying…';
+    fetch('/__verify?id=' + encodeURIComponent(RID), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: location.pathname })
+    }).then(function (r) {
+      return r.ok ? r.json() : null;
+    }).then(function (d) {
+      if (d && d.target) {
+        setState('verified');
+        lead.textContent = 'Verified';
+        btn.setAttribute('aria-label', 'Verified — you are human');
+        location.replace(d.target);
+        return;
+      }
+      throw new Error('no target');
+    }).catch(function () {
+      setState('idle');
+      setFill(0);
+      lead.textContent = 'Try again';
+    });
+  }
+
+  btn.addEventListener('pointerdown', function (e) {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault();
+    try { btn.setPointerCapture(e.pointerId); } catch (err) {}
+    startHold();
+  });
+  btn.addEventListener('pointerup', function () { cancelHold(); });
+  btn.addEventListener('pointercancel', function () { cancelHold(); });
+  btn.addEventListener('lostpointercapture', function () { cancelHold(); });
+  btn.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+  var keyHeld = false;
+  btn.addEventListener('keydown', function (e) {
+    if (e.key === ' ' || e.key === 'Enter' || e.code === 'Space') {
+      e.preventDefault();
+      if (keyHeld) return;
+      keyHeld = true;
+      startHold();
+    }
+  });
+  btn.addEventListener('keyup', function (e) {
+    if (e.key === ' ' || e.key === 'Enter' || e.code === 'Space') {
+      keyHeld = false;
+      cancelHold();
+    }
+  });
+  btn.addEventListener('blur', function () {
+    if (keyHeld) { keyHeld = false; cancelHold(); }
+  });
+})();
+</script>
+</body></html>`;
 }
