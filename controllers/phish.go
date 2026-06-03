@@ -129,13 +129,13 @@ func (ps *PhishingServer) signatureMatches(r *http.Request, msg string) bool {
 }
 
 // validateSignature validates the id-bound signature the redirector appends to
-// the server-side-fetched /hi and /beep endpoints:
+// the server-side-fetched /hi endpoint:
 //
 //	?id=<rid>&sig=<hex HMAC-SHA256(secret, rid)>
 //
-// These are fetched by the redirector itself (not the visitor's browser), so
-// the connecting IP gophish sees is the redirector's, not the target's — hence
-// they are bound to the rid alone, not the IP.
+// /hi is fetched by the redirector itself (not the visitor's browser), so the
+// connecting IP gophish sees is the redirector's, not the target's — hence it
+// is bound to the rid alone, not the IP.
 func (ps *PhishingServer) validateSignature(r *http.Request) bool {
 	rid := r.URL.Query().Get(models.RecipientParameter)
 	return ps.signatureMatches(r, rid)
@@ -165,8 +165,6 @@ func (ps *PhishingServer) registerRoutes() {
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", fileServer))
 	router.HandleFunc("/hi", ps.TrackHandler)
 	router.HandleFunc("/{path:.*}/hi", ps.TrackHandler)
-	router.HandleFunc("/beep", ps.BeepHandler)
-	router.HandleFunc("/{path:.*}/beep", ps.BeepHandler)
 	router.HandleFunc("/robots.txt", ps.RobotsHandler)
 	router.HandleFunc("/{path:.*}", ps.PhishHandler)
 	router.NotFoundHandler = http.HandlerFunc(ps.phishNotFound)
@@ -208,33 +206,6 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 		log.Error(err)
 	}
 	http.ServeFile(w, r, "static/images/pixel.png")
-}
-
-// BeepHandler is the upstream redirector's bot-detection signal endpoint.
-// Cloudflare Worker (or any redirector) makes a server-side GET to
-// /beep?id=<rid>&sig=<sig> when it has decided the visitor is a bot. On a
-// valid signature, gophish appends a "Bot Click" event to the result's
-// timeline; it never renders anything and returns 200 with no body. Fetched
-// server-side by the redirector, so it is signed against the rid alone.
-func (ps *PhishingServer) BeepHandler(w http.ResponseWriter, r *http.Request) {
-	if !ps.validateSignature(r) {
-		ps.phishNotFound(w, r)
-		return
-	}
-	r, err := setupContext(r)
-	if err != nil {
-		if err != ErrInvalidRequest && err != ErrCampaignComplete {
-			log.Error(err)
-		}
-		ps.phishNotFound(w, r)
-		return
-	}
-	rs := ctx.Get(r, "result").(models.Result)
-	d := ctx.Get(r, "details").(models.EventDetails)
-	if err := rs.HandleBotClick(d); err != nil {
-		log.Error(err)
-	}
-	w.WriteHeader(http.StatusOK)
 }
 
 // PhishHandler handles incoming client connections and registers the associated actions performed

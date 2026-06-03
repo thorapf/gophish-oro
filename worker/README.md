@@ -52,15 +52,14 @@ Restart GoPhish after editing `config.json`.
 | Request to redirector            | Action |
 |----------------------------------|--------|
 | `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&sig=<hmac>` (fire-and-forget; `sig` over the id alone). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
-| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&sig=<hmac>` (`sig` over the id alone) so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `<PHISH_ORIGIN>/404`. |
-| `GET /<path>?id=<rid>` (layer-1 pass)| Worker serves a visually-blank HTML page with an embedded JS challenge that runs `navigator.webdriver` / plugin / WebGL / screen checks and POSTs the result to `/__verify`. |
-| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&sig=<hmac>` where `sig = HMAC(secret, id + "." + CF-Connecting-IP)`, and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns `{target: <PHISH_ORIGIN>/404}` so the page redirects there. |
+| `GET /<path>?id=<rid>`           | Worker serves the **press-and-hold page** — a visible button the visitor must hold for ~1.2s. No User-Agent, ASN, or fingerprint check. |
+| `POST /__verify?id=<rid>`        | Sent by the page once the hold completes. Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&sig=<hmac>` where `sig = HMAC(secret, id + "." + CF-Connecting-IP)` and returns it as JSON; the page does `location.replace(target)`. |
 | Anything without `?id=<rid>`     | 302 to `<PHISH_ORIGIN>/404`. |
 
 `<PHISH_ORIGIN>/404` has no dedicated route on GoPhish: the catch-all sees
 no valid signature and forwards to GoPhish's `not_found_redirect_url`. So
-every dead-end — no id, bad path, or detected bot — funnels through GoPhish
-to a single benign destination.
+every dead-end — no id or bad path — funnels through GoPhish to a single
+benign destination.
 
 There is no expiry and no per-rid burn. The signed landing URL stays valid
 for as long as the visitor keeps the same `CF-Connecting-IP`, so reloads and
@@ -76,59 +75,40 @@ re-runs the bot checks and mints a fresh IP-bound URL.
 > normalize the IP to its `/64` prefix identically in both `worker.js`
 > (`signedParamsIP`) and gophish (`clientIP`) before hashing.
 
-## Bot detection — two layers
+## Bot defense — press and hold
 
-### Layer 1: request-time heuristics (cheap, no JS)
+The click page (`GET /<path>?id=<rid>`) is a single visible card with a
+**Press & Hold** button. The visitor must hold it for `HOLD_MS` (default
+1200ms, a constant in `worker.js`); a progress bar fills as they hold.
+Releasing early resets it. Only when the bar fills does the page POST to
+`/__verify` and `location.replace` to the IP-bound landing URL the Worker
+returns.
 
-Any one of these flags the request as a bot before any HTML is served:
+There is no User-Agent regex, no ASN deny list, and no environment
+fingerprinting. The gate is simply: *execute JS and perform a sustained
+held-pointer gesture.*
 
-1. **User-Agent regex** — `curl`, `wget`, `python-requests`, `HeadlessChrome`,
-   `Puppeteer`, common scanner names (`Pingdom`, `Mimecast`, `ProofPoint`,
-   etc.). Empty UA also flagged.
-2. **ASN deny list** — datacenter ASNs (AWS, GCP, Azure, OVH, DigitalOcean,
-   Hetzner, Linode, Vultr) and email-security vendor ASNs (ProofPoint,
-   Mimecast, Barracuda, Symantec). Real users are almost never on these.
-3. **Cloudflare's verified-bot flag** — `request.cf.botManagement.verifiedBot`
-   (Googlebot, Bingbot, etc.).
-4. **Sec-Fetch-Mode / Sec-Fetch-Site missing** — real browsers send these
-   on every top-level navigation. Most automated tooling doesn't.
-5. **Accept-Language missing** — headless tooling defaults often omit it.
+What this stops:
 
-Edit the `BOT_UA_RE` regex and `BLOCKED_ASNS` set inside `worker.js` to tune
-for your engagement.
+- Non-JS link scanners and mailbox prefetchers — they fetch the page, never
+  run the script, never POST, and so never reach GoPhish.
+- Plain crawlers that follow links but don't simulate a held-pointer gesture.
 
-### Layer 2: invisible JS challenge
+What it does **not** stop (accepted trade-off for simplicity):
 
-After layer 1 passes, the Worker serves a tiny HTML page that's visually
-blank. An embedded script runs immediately and collects:
+- A headless browser specifically scripted to dispatch the press-and-hold.
+- A client that POSTs to `/__verify` directly — the gesture is enforced
+  client-side only; the server trusts the POST. (Replay of the *resulting*
+  landing URL from another network is still blocked by the IP-bound
+  signature.)
+- A human analyst who manually holds the button.
 
-- `navigator.webdriver` (set by Selenium / Puppeteer / Playwright defaults)
-- `navigator.plugins.length` and `navigator.languages.length`
-- `navigator.hardwareConcurrency`
-- `window.screen.width / height`
-- Canvas fingerprint (last 32 chars of `toDataURL()`)
-- WebGL unmasked renderer (catches "SwiftShader", "llvmpipe", "Mesa", etc.)
+To change the hold time, edit `HOLD_MS`. To restyle the card, edit
+`pressHoldHTML` in `worker.js`.
 
-The signals are POSTed back to the Worker's `/__verify` endpoint. The
-Worker evaluates and either returns the IP-bound GoPhish target URL on
-pass, or fires the `/beep` event and returns `{target: <PHISH_ORIGIN>/404}`.
-The embedded JS does `location.replace(target)` either way; on a fail it
-simply lands on the benign not-found destination.
-
-What this catches that layer 1 doesn't:
-
-- Headless Chrome / Puppeteer / Selenium running on residential IPs.
-- Real-Chrome scanners with all the right headers but bot-shaped JS env.
-- Tools that don't execute JS at all (the page stays blank, no redirect).
-
-What it doesn't catch:
-
-- A human analyst manually clicking the link on their workstation.
-- Bot frameworks specifically tuned to evade these checks (uncommon for
-  general-purpose scanners).
-
-There's no captcha and no visible "verifying browser" message. Real
-users see a blank page for ~200–500ms while JS runs and redirects.
+> The `/beep` *Bot Click* signal is no longer fired by the Worker (nothing
+> classifies bots now). GoPhish's `/beep` route still exists but is unused;
+> leave it or remove it as you like.
 
 ## Landing page authoring (one rule)
 
@@ -158,15 +138,16 @@ GoPhish without a signature and dead-end to `not_found_redirect_url`.
 
 ## Verifying the setup
 
-1. Open your campaign URL in a real browser. Should land on the GoPhish
-   landing page; the campaign timeline shows *Clicked Link* with your IP.
+1. Open your campaign URL in a real browser. You should see the press-and-hold
+   card; hold the button for ~1.2s and you land on the GoPhish landing page,
+   with the campaign timeline showing *Clicked Link* and your IP.
 2. From a terminal:
    ```
-   curl -v "https://redirector.example.com/abc?id=<your-rid>"
+   curl -s "https://redirector.example.com/abc?id=<your-rid>"
    ```
-   `curl` is flagged by layer 1, so this should return a `302` to
-   `<PHISH_ORIGIN>/404`, and the campaign timeline should show a
-   *Bot Click* event for that rid.
+   With no UA/ASN blocking, this now returns the **press-and-hold HTML**
+   (`200`). `curl` doesn't run JS or perform the gesture, so it never POSTs
+   to `/__verify` and never reaches a landing page — which is the point.
 3. Try direct access to GoPhish bypassing the redirector:
    ```
    curl -v "https://phish.example.com/?id=<your-rid>"
