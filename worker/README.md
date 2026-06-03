@@ -106,9 +106,8 @@ What it does **not** stop (accepted trade-off for simplicity):
 To change the hold time, edit `HOLD_MS`. To restyle the card, edit
 `pressHoldHTML` in `worker.js`.
 
-> The `/beep` *Bot Click* signal is no longer fired by the Worker (nothing
-> classifies bots now). GoPhish's `/beep` route still exists but is unused;
-> leave it or remove it as you like.
+> The `/beep` *Bot Click* signal is gone: the Worker no longer fires it
+> (nothing classifies bots now) and GoPhish's `/beep` route has been removed.
 
 ## Landing page authoring (one rule)
 
