@@ -26,21 +26,23 @@
  *   /__verify?id=<rid>        → JS-challenge submission. Validates
  *                               signals, returns {target} JSON on pass.
  *
+ * Any request without a valid ?id=, and any request from a detected bot,
+ * is 302-redirected to PHISH_ORIGIN/404 (which GoPhish in turn sends to
+ * its configured not_found_redirect_url).
+ *
  * Env vars (configure in Cloudflare dashboard → Workers → Settings → Variables):
  *   SECRET            64-char hex string. Must match
  *                     phish_server.redirector.secret in GoPhish config.json.
  *   PHISH_ORIGIN      e.g. https://phish.example.com (no trailing slash needed)
- *   BOT_LANDING_URL   (optional) where to send detected bots; if unset,
- *                     returns 204 No Content.
  */
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const rid = url.searchParams.get('id');
-    if (!rid) return botLanding(env);
-
     const origin = (env.PHISH_ORIGIN || '').replace(/\/+$/, '');
+    const rid = url.searchParams.get('id');
+    if (!rid) return notFound(origin);
+
     const key = await importHmacKey(env.SECRET);
 
     // /hi tracking pixel — Worker fires a server-side GET, returns 204.
@@ -55,14 +57,14 @@ export default {
 
     // JS challenge submission endpoint.
     if (url.pathname === '/__verify') {
-      return handleVerify(request, rid, key, origin, env, ctx);
+      return handleVerify(request, rid, key, origin, ctx);
     }
 
     // Click path — layer-1 heuristic check.
     const verdict = classify(request);
     if (verdict.bot) {
       await fireBeep(rid, key, origin, ctx);
-      return botLanding(env);
+      return notFound(origin);
     }
 
     // Layer 2 — serve the JS challenge as a visually blank HTML page.
@@ -82,29 +84,34 @@ export default {
 // /__verify — JS challenge submission handler
 // ─────────────────────────────────────────────────────────────────────
 
-async function handleVerify(request, rid, key, origin, env, ctx) {
+async function handleVerify(request, rid, key, origin, ctx) {
   if (request.method !== 'POST') {
     return new Response(null, { status: 405 });
   }
+
+  // On any failure the response carries target = PHISH_ORIGIN/404, so the
+  // challenge page's location.replace(target) sends the bot there — the
+  // same destination as a no-id visit.
+  const reject = () => jsonResponse({ target: `${origin}/404` }, 200);
 
   // Re-apply the cheap heuristic. A bot could POST directly to /__verify
   // bypassing the GET-challenge step; this catches that.
   const verdict = classify(request);
   if (verdict.bot) {
     await fireBeep(rid, key, origin, ctx);
-    return jsonResponse({ ok: false }, 403);
+    return reject();
   }
 
   let body;
   try {
     body = await request.json();
   } catch (e) {
-    return jsonResponse({ ok: false }, 400);
+    return reject();
   }
 
   if (!signalsLookHuman(body && body.signals)) {
     await fireBeep(rid, key, origin, ctx);
-    return jsonResponse({ ok: false }, 403);
+    return reject();
   }
 
   // Pass — mint the time-bound signed target URL on the original path.
@@ -184,14 +191,15 @@ function jsonResponse(obj, status) {
   });
 }
 
-function botLanding(env) {
-  if (env.BOT_LANDING_URL) {
-    return new Response(null, {
-      status: 302,
-      headers: { 'Location': env.BOT_LANDING_URL, 'Cache-Control': 'no-store' },
-    });
-  }
-  return new Response(null, { status: 204 });
+// notFound 302-redirects to PHISH_ORIGIN/404. Used for any request without
+// a valid ?id= and for detected bots. GoPhish has no /404 route, so the
+// catch-all rejects it (no valid signature) and forwards to its configured
+// not_found_redirect_url.
+function notFound(origin) {
+  return new Response(null, {
+    status: 302,
+    headers: { 'Location': `${origin}/404`, 'Cache-Control': 'no-store' },
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────

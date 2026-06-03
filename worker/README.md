@@ -26,12 +26,6 @@ that it bounces the visitor back to this Worker for re-verification.
 | `SECRET`          | 64 hex chars (32 bytes)                  | HMAC key. Must match `phish_server.redirector.secret` in GoPhish `config.json`. Generate with `openssl rand -hex 32`. |
 | `PHISH_ORIGIN`    | `https://phish.example.com`              | Where the actual GoPhish phishing server lives. Origin only (no path). |
 
-## Optional environment variables
-
-| Name              | Example                                  | Purpose |
-|-------------------|------------------------------------------|---------|
-| `BOT_LANDING_URL` | `https://www.example.com/marketing`      | Where bots get 302'd. If unset, bots get a quiet `204 No Content`. |
-
 ## GoPhish-side configuration
 
 In your GoPhish `config.json`, under `phish_server`:
@@ -49,10 +43,15 @@ Restart GoPhish after editing `config.json`.
 | Request to redirector            | Action |
 |----------------------------------|--------|
 | `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&exp=<unix>&sig=<hmac>` (fire-and-forget). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
-| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&exp=<unix>&sig=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
+| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&exp=<unix>&sig=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `<PHISH_ORIGIN>/404`. |
 | `GET /<path>?id=<rid>` (layer-1 pass)| Worker serves a visually-blank HTML page with an embedded JS challenge that runs `navigator.webdriver` / plugin / WebGL / screen checks and POSTs the result to `/__verify`. |
-| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&exp=<unix>&sig=<hmac>` and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns 403. |
-| Anything without `?id=<rid>`     | 302 to `BOT_LANDING_URL` (or 204). |
+| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&exp=<unix>&sig=<hmac>` and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns `{target: <PHISH_ORIGIN>/404}` so the page redirects there. |
+| Anything without `?id=<rid>`     | 302 to `<PHISH_ORIGIN>/404`. |
+
+`<PHISH_ORIGIN>/404` has no dedicated route on GoPhish: the catch-all sees
+no valid signature and forwards to GoPhish's `not_found_redirect_url`. So
+every dead-end — no id, bad path, or detected bot — funnels through GoPhish
+to a single benign destination.
 
 The signed URL is valid for 60 seconds (`TOKEN_TTL_SECONDS` in `worker.js`).
 If a real user takes longer than that to submit the login form, GoPhish
@@ -147,8 +146,9 @@ GoPhish without a token and dead-end to `not_found_redirect_url`.
    ```
    curl -v "https://redirector.example.com/abc?id=<your-rid>"
    ```
-   Should return `204` (or 302 to `BOT_LANDING_URL`). The campaign
-   timeline should show a *Bot Click* event for that rid.
+   `curl` is flagged by layer 1, so this should return a `302` to
+   `<PHISH_ORIGIN>/404`, and the campaign timeline should show a
+   *Bot Click* event for that rid.
 3. Try direct access to GoPhish bypassing the redirector:
    ```
    curl -v "https://phish.example.com/?id=<your-rid>"
