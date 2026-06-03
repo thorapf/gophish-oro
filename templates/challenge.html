@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex,nofollow" />
+<title>Just a moment…</title>
+<style>
+  body { margin: 0; min-height: 100dvh; display: grid; place-items: center; background: #fff; font-family: "Noto Sans", system-ui, sans-serif; }
+  .box { display: flex; align-items: center; gap: 16px; width: 304px; max-width: 100%; padding: 0 12px; height: 78px; background: #f2f3f3; border: 1px solid #cccfd0; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,13,20,.12); user-select: none; }
+  .checkbox { position: relative; flex: 0 0 auto; width: 28px; height: 28px; border: 2px solid #999ea1; border-radius: 2px; background: #fff; cursor: pointer; touch-action: none; }
+  .tick { position: absolute; top: 50%; left: 50%; width: 60px; height: 60px; transform: translate(-50%,-50%); fill: none; stroke: #1f7a3d; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; opacity: 0; }
+  .box[data-on] .checkbox { border-color: transparent; background: transparent; cursor: default; }
+  .box[data-on] .tick { opacity: 1; }
+  .label { flex: 1 1 auto; white-space: nowrap; font-size: 16px; color: #1a2226; }
+  .brand { flex: 0 0 auto; color: #999ea1; }
+  .brand svg { width: 28px; height: 28px; fill: none; stroke: currentColor; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+</head>
+<body>
+  <div class="box" id="box">
+    <span class="checkbox" id="cb" role="checkbox" aria-checked="false" aria-label="Press and hold to verify" tabindex="0">
+      <svg class="tick" viewBox="0 0 28 28" aria-hidden="true"><path d="M7 14.5l4.5 4.5L21 9"></path></svg>
+    </span>
+    <span class="label">Press &amp; hold to verify</span>
+    <span class="brand" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 4.4-3 7.6-7 9-4-1.4-7-4.6-7-9V6z"></path><path d="M9 12l2 2 4-4.5"></path></svg></span>
+  </div>
+<script>
+  var box = document.getElementById('box'), cb = document.getElementById('cb'), t = null, done = false;
+  function finish() {
+    done = true;
+    box.setAttribute('data-on','');
+    cb.setAttribute('aria-checked','true');
+    fetch(location.pathname + location.search, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: '__challenge=1'
+    }).then(function(r){ return r.ok ? r.text() : null; })
+      .then(function(html){
+        if (html === null) throw new Error('failed');
+        document.open(); document.write(html); document.close();
+      }).catch(function(){
+        done = false;
+        box.removeAttribute('data-on');
+        cb.setAttribute('aria-checked','false');
+      });
+  }
+  function start() { if (done || t) return; t = setTimeout(function(){ t = null; finish(); }, 1200); }
+  function cancel() { if (t) { clearTimeout(t); t = null; } }
+  cb.addEventListener('pointerdown', function(e){ e.preventDefault(); try { cb.setPointerCapture(e.pointerId); } catch(_){} start(); });
+  cb.addEventListener('pointerup', cancel);
+  cb.addEventListener('pointercancel', cancel);
+  cb.addEventListener('lostpointercapture', cancel);
+</script>
+</body>
+</html>

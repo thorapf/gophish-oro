@@ -18,23 +18,13 @@ type AdminServer struct {
 	TrustedOrigins       []string `json:"trusted_origins"`
 }
 
-// RedirectorConfig describes the upstream redirector (e.g. a Cloudflare
-// Worker) that gates access to the phishing server. Secret is the shared
-// hex-encoded key used by both the redirector and gophish to derive an
-// HMAC-SHA256 token over the rid; the phishing server rejects any request
-// whose ?token= query parameter doesn't match the recomputed HMAC.
-type RedirectorConfig struct {
-	Secret string `json:"secret"`
-}
-
 // PhishServer represents the Phish server configuration details
 type PhishServer struct {
-	ListenURL           string           `json:"listen_url"`
-	UseTLS              bool             `json:"use_tls"`
-	CertPath            string           `json:"cert_path"`
-	KeyPath             string           `json:"key_path"`
-	NotFoundRedirectURL string           `json:"not_found_redirect_url"`
-	Redirector          RedirectorConfig `json:"redirector"`
+	ListenURL           string `json:"listen_url"`
+	UseTLS              bool   `json:"use_tls"`
+	CertPath            string `json:"cert_path"`
+	KeyPath             string `json:"key_path"`
+	NotFoundRedirectURL string `json:"not_found_redirect_url"`
 }
 
 // Config represents the configuration information.

@@ -122,6 +122,16 @@ func (r *Result) HandleClickedLink(details EventDetails) error {
 	return db.Save(r).Error
 }
 
+// HandleCompletedChallenge records that the recipient cleared the press-and-hold
+// challenge gate and was served the landing page. It is appended to the timeline
+// only: the Result's Status and modification date are left unchanged (the click
+// itself was already recorded on the initial GET), so this event sits alongside
+// the existing activity rather than transitioning the result.
+func (r *Result) HandleCompletedChallenge(details EventDetails) error {
+	_, err := r.createEvent(EventCompletedChallenge, details)
+	return err
+}
+
 // HandleFormSubmit updates a Result in the case where the recipient submitted
 // credentials to the form on a Landing Page.
 func (r *Result) HandleFormSubmit(details EventDetails) error {
