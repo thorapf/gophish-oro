@@ -2,8 +2,12 @@
 
 A single-file Cloudflare Worker that gates access to a GoPhish phishing
 server. Filters bots and email-link sandboxes; passes real users through
-to GoPhish. Authentication to GoPhish is via an HMAC-SHA256 token over
-the rid, using a shared secret known to both this Worker and GoPhish.
+to GoPhish. Authentication to GoPhish is via a time-bound signed URL:
+the Worker appends `&exp=<unix>&sig=<hmac>` where
+`sig = HMAC-SHA256(secret, id + "." + exp)`, using a shared secret known
+to both this Worker and GoPhish. GoPhish recomputes the signature and
+serves the landing page only while `now < exp` (60-second window). After
+that it bounces the visitor back to this Worker for re-verification.
 
 ## Deployment (no wrangler, no CLI)
 
@@ -44,11 +48,17 @@ Restart GoPhish after editing `config.json`.
 
 | Request to redirector            | Action |
 |----------------------------------|--------|
-| `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&token=<hmac>` (fire-and-forget). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
-| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&token=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
+| `GET /<path>/hi?id=<rid>`        | Worker fires a server-side GET to `<PHISH_ORIGIN>/<path>/hi?id=<rid>&exp=<unix>&sig=<hmac>` (fire-and-forget). Mail client gets a `204 No Content` directly from the Worker. No reliance on image-loaders following redirects. GoPhish logs *Email Opened*. |
+| `GET /<path>?id=<rid>` (layer-1 bot) | Fire-and-forget GET to `<PHISH_ORIGIN>/beep?id=<rid>&exp=<unix>&sig=<hmac>` so GoPhish records a *Bot Click* event for this rid. Then 302 the bot to `BOT_LANDING_URL` (or 204). |
 | `GET /<path>?id=<rid>` (layer-1 pass)| Worker serves a visually-blank HTML page with an embedded JS challenge that runs `navigator.webdriver` / plugin / WebGL / screen checks and POSTs the result to `/__verify`. |
-| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&token=<hmac>` and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns 403. |
+| `POST /__verify?id=<rid>`        | JS-challenge submission. If signals look human, Worker mints `<PHISH_ORIGIN>/<path>?id=<rid>&exp=<unix>&sig=<hmac>` and returns it as JSON; client-side JS does `location.replace(target)`. If signals fail, Worker fires the `/beep` event and returns 403. |
 | Anything without `?id=<rid>`     | 302 to `BOT_LANDING_URL` (or 204). |
+
+The signed URL is valid for 60 seconds (`TOKEN_TTL_SECONDS` in `worker.js`).
+If a real user takes longer than that to submit the login form, GoPhish
+bounces them back here, the JS challenge runs again, and they get a fresh
+60-second window with the form re-served. There is no per-rid burn — a rid
+stays usable for the whole campaign; only individual signed URLs expire.
 
 ## Bot detection — two layers
 
@@ -143,7 +153,7 @@ GoPhish without a token and dead-end to `not_found_redirect_url`.
    ```
    curl -v "https://phish.example.com/?id=<your-rid>"
    ```
-   Should return 302 to `not_found_redirect_url` (no token).
+   Should return 302 to `not_found_redirect_url` (no valid signature).
 
 ## Rotation
 

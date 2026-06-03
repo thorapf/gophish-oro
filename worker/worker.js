@@ -7,11 +7,12 @@
  *            and checks navigator.webdriver / plugins / WebGL renderer /
  *            screen / hardware concurrency before allowing the redirect.
  *
- * Authentication to GoPhish is via an HMAC-SHA256 token computed over
- * the rid (?id=<uuid>) using a shared secret. The token is appended to
- * every URL the Worker sends to GoPhish (either via 302 Location or via
- * server-side fetch). GoPhish rejects any request whose ?token= doesn't
- * recompute to the expected HMAC.
+ * Authentication to GoPhish is via a time-bound signed URL. The Worker
+ * appends id, exp (unix expiry = now + 60s), and sig = HMAC-SHA256(secret,
+ * id + "." + exp) to every URL it sends to GoPhish. GoPhish recomputes the
+ * signature and serves the landing page only while now < exp; once the
+ * window passes it bounces the visitor back here for re-verification.
+ * There is no per-rid burn — only the short-lived signed URL expires.
  *
  * Endpoints:
  *   /<anything>/hi?id=<rid>   → tracking pixel. Worker fires a
@@ -44,8 +45,7 @@ export default {
 
     // /hi tracking pixel — Worker fires a server-side GET, returns 204.
     if (/\/hi$/.test(url.pathname)) {
-      const token = await computeToken(rid, key);
-      const target = `${origin}${url.pathname}?id=${encodeURIComponent(rid)}&token=${token}`;
+      const target = `${origin}${url.pathname}?${await signedParams(rid, key)}`;
       ctx.waitUntil(fetch(target, { method: 'GET' }).catch(() => {}));
       return new Response(null, {
         status: 204,
@@ -107,10 +107,9 @@ async function handleVerify(request, rid, key, origin, env, ctx) {
     return jsonResponse({ ok: false }, 403);
   }
 
-  // Pass — mint the target URL (rid + HMAC token, on the original path).
+  // Pass — mint the time-bound signed target URL on the original path.
   const path = sanitizePath(body && body.path);
-  const token = await computeToken(rid, key);
-  const target = `${origin}${path}?id=${encodeURIComponent(rid)}&token=${token}`;
+  const target = `${origin}${path}?${await signedParams(rid, key)}`;
   return jsonResponse({ target }, 200);
 }
 
@@ -126,8 +125,12 @@ function sanitizePath(p) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// HMAC token
+// Time-bound signed URL
 // ─────────────────────────────────────────────────────────────────────
+
+// TTL for a signed URL, in seconds. GoPhish serves the landing page only
+// while now < exp; after that it bounces back here for re-verification.
+const TOKEN_TTL_SECONDS = 60;
 
 async function importHmacKey(hexSecret) {
   return crypto.subtle.importKey(
@@ -139,14 +142,18 @@ async function importHmacKey(hexSecret) {
   );
 }
 
-async function computeToken(rid, key) {
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rid));
-  return toHex(new Uint8Array(sig));
+// signedParams returns the query string "id=<rid>&exp=<unix>&sig=<hex>"
+// where sig = HMAC-SHA256(secret, rid + "." + exp). The "." delimiter must
+// match the gophish side exactly.
+async function signedParams(rid, key) {
+  const exp = Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS;
+  const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(rid + '.' + exp));
+  const sig = toHex(new Uint8Array(sigBuf));
+  return `id=${encodeURIComponent(rid)}&exp=${exp}&sig=${sig}`;
 }
 
 async function fireBeep(rid, key, origin, ctx) {
-  const token = await computeToken(rid, key);
-  const beepTarget = `${origin}/beep?id=${encodeURIComponent(rid)}&token=${token}`;
+  const beepTarget = `${origin}/beep?${await signedParams(rid, key)}`;
   ctx.waitUntil(fetch(beepTarget, { method: 'GET' }).catch(() => {}));
 }
 
