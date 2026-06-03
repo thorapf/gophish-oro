@@ -39,7 +39,7 @@ var statuses = {
     "Completed Challenge": {
         color: "#0F69BD",
         label: "label-primary",
-        icon: "fa-hand-pointer",
+        icon: "fa-puzzle-piece",
         point: "ct-point-clicked"
     },
     "Success": {
